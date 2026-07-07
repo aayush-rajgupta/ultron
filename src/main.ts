@@ -7,6 +7,7 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
   proto,
   WASocket,
+  jidNormalizedUser,
 } from '@whiskeysockets/baileys';
 import { initAuthCreds } from '@whiskeysockets/baileys/lib/Utils/auth-utils';
 import { useMultiFileAuthState } from '@whiskeysockets/baileys/lib/Utils/use-multi-file-auth-state';
@@ -14,6 +15,7 @@ import qrcode from 'qrcode-terminal';
 import pino from 'pino';
 import { PrismaClient } from '@prisma/client';
 import { createClient } from 'redis';
+import { PluginRuntime, generateAiResponse } from './plugins';
 
 // Save original console functions
 const originalLog = console.log;
@@ -52,7 +54,7 @@ const customLogger = {
     const timeStr = `${colors.gray}[${formatTime()}]${colors.reset}`;
     const catColor = categoryColors[category] || colors.reset;
     const catStr = `${catColor}[${category.padEnd(8)}]${colors.reset}`;
-    originalLog(`${timeStr} ${catStr} ${message}`, ...args);
+    originalLog(`${timeStr} ${catStr} -> ${message}`, ...args);
   },
   system(message: string, ...args: any[]) { this.log('SYSTEM', message, ...args); },
   whatsapp(message: string, ...args: any[]) { this.log('WHATSAPP', message, ...args); },
@@ -93,16 +95,42 @@ function handleNoisyLog(message: string) {
   }
 }
 
+// Save original stdout/stderr write functions
+const originalStdoutWrite = process.stdout.write;
+const originalStderrWrite = process.stderr.write;
+
+function shouldFilter(str: string): boolean {
+  return (
+    str.includes("MessageCounterError") ||
+    str.includes("Session error:") ||
+    str.includes("Bad MAC") ||
+    str.includes("Decryption recovery") ||
+    str.includes("libsignal")
+  );
+}
+
+process.stdout.write = function (chunk: any, encoding?: any, callback?: any): boolean {
+  const str = typeof chunk === 'string' ? chunk : chunk.toString();
+  if (shouldFilter(str)) {
+    if (callback) callback();
+    return true;
+  }
+  return originalStdoutWrite.call(process.stdout, chunk, encoding, callback);
+};
+
+process.stderr.write = function (chunk: any, encoding?: any, callback?: any): boolean {
+  const str = typeof chunk === 'string' ? chunk : chunk.toString();
+  if (shouldFilter(str)) {
+    if (callback) callback();
+    return true;
+  }
+  return originalStderrWrite.call(process.stderr, chunk, encoding, callback);
+};
+
 // Override console methods to filter libsignal noise
 console.log = (...args: any[]) => {
   const combined = args.map(safeStringify).join(' ');
-  if (
-    combined.includes('Bad MAC') ||
-    combined.includes('Failed to decrypt message') ||
-    combined.includes('Closing open session') ||
-    combined.includes('Closing session:') ||
-    combined.includes('SessionEntry')
-  ) {
+  if (shouldFilter(combined)) {
     handleNoisyLog(combined);
     return;
   }
@@ -111,13 +139,7 @@ console.log = (...args: any[]) => {
 
 console.warn = (...args: any[]) => {
   const combined = args.map(safeStringify).join(' ');
-  if (
-    combined.includes('Bad MAC') ||
-    combined.includes('Failed to decrypt message') ||
-    combined.includes('Closing open session') ||
-    combined.includes('Closing session:') ||
-    combined.includes('SessionEntry')
-  ) {
+  if (shouldFilter(combined)) {
     handleNoisyLog(combined);
     return;
   }
@@ -126,13 +148,7 @@ console.warn = (...args: any[]) => {
 
 console.info = (...args: any[]) => {
   const combined = args.map(safeStringify).join(' ');
-  if (
-    combined.includes('Bad MAC') ||
-    combined.includes('Failed to decrypt message') ||
-    combined.includes('Closing open session') ||
-    combined.includes('Closing session:') ||
-    combined.includes('SessionEntry')
-  ) {
+  if (shouldFilter(combined)) {
     handleNoisyLog(combined);
     return;
   }
@@ -141,18 +157,31 @@ console.info = (...args: any[]) => {
 
 console.error = (...args: any[]) => {
   const combined = args.map(safeStringify).join(' ');
-  if (
-    combined.includes('Bad MAC') ||
-    combined.includes('Failed to decrypt message') ||
-    combined.includes('Closing open session') ||
-    combined.includes('Closing session:') ||
-    combined.includes('SessionEntry')
-  ) {
+  if (shouldFilter(combined)) {
     handleNoisyLog(combined);
     return;
   }
   originalError(...args);
 };
+
+// Handle process-wide errors silently if they are noisy warnings
+process.on('uncaughtException', (err: any) => {
+  const errMsg = err?.message || String(err);
+  const errStack = err?.stack || '';
+  if (shouldFilter(errMsg) || shouldFilter(errStack)) {
+    return;
+  }
+  customLogger.error(`Uncaught Exception: ${errMsg}`, err);
+});
+
+process.on('unhandledRejection', (reason: any) => {
+  const reasonMsg = reason?.message || String(reason);
+  const reasonStack = reason?.stack || '';
+  if (shouldFilter(reasonMsg) || shouldFilter(reasonStack)) {
+    return;
+  }
+  customLogger.error(`Unhandled Rejection: ${reasonMsg}`, reason);
+});
 
 const redisUrl = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379';
 const prisma = new PrismaClient({ datasources: { db: { url: process.env.DATABASE_URL ?? 'postgresql://postgres:postgres@localhost:5432/ultron' } } });
@@ -165,14 +194,162 @@ const redis = createClient({
 });
 
 let initialized = false;
-let socket: WASocket | undefined;
+export let socket: WASocket | undefined;
+export function setSocket(s: WASocket | undefined) {
+  socket = s;
+}
 let reconnectTimer: NodeJS.Timeout | undefined;
 let reconnecting = false;
 let authState: any | undefined;
 let activeSocketId = 0;
 let messagesReceived = 0;
-let processedMessageIds = new Set<string>();
+export let processedMessageIds = new Set<string>();
 const bootTimestampMs = Date.now();
+
+export let prismaConnected = false;
+export let redisConnected = false;
+export let hasSentBootNotification = false;
+
+export function setPrismaConnected(b: boolean) {
+  prismaConnected = b;
+}
+export function setRedisConnected(b: boolean) {
+  redisConnected = b;
+}
+
+function printBanner(): void {
+  const banner = `
+${colors.cyan}  _   _ _  _____ ___   ___  _  _ ${colors.reset}
+${colors.cyan} | | | | ||_   _| _ \\ / _ \\| \\| |${colors.reset}
+${colors.blue} | |_| | |__| | |   /| (_) | .\` |${colors.reset}
+${colors.blue}  \\___/|____|_| |_|_\\_\\___/|_|\\_|${colors.reset}
+  `;
+  originalLog(banner);
+}
+
+function printStatusTable(dbStatus: string, redisStatus: string, jid: string): void {
+  const envMode = process.env.NODE_ENV === 'production' ? 'Production' : 'Development';
+  const dbStr = dbStatus === 'connected' ? 'Connected (Neon)' : 'Disconnected';
+  const cacheStr = redisStatus === 'connected' ? 'Connected (Upstash)' : 'Disconnected';
+  const userStr = jid || 'Not Authorized';
+
+  const line = (label: string, value: string) => {
+    const labelPad = label.padEnd(20);
+    const valPad = value.padEnd(31);
+    return `│ ${colors.cyan}${labelPad}${colors.reset} │ ${colors.green}${valPad}${colors.reset} │`;
+  };
+
+  originalLog(`┌──────────────────────┬─────────────────────────────────┐`);
+  originalLog(`│                 ${colors.cyan}SYSTEM INITIALIZATION${colors.reset}                  │`);
+  originalLog(`├──────────────────────┼─────────────────────────────────┤`);
+  originalLog(line('Version / Env', `v0.1.0 (${envMode})`));
+  originalLog(line('Database (Prisma)', dbStr));
+  originalLog(line('Cache (Redis)', cacheStr));
+  originalLog(line('Connected Account', userStr));
+  originalLog(`└──────────────────────┴─────────────────────────────────┘`);
+}
+
+export const fallbackChatState = new Map<string, { approved: boolean; stopped: boolean }>();
+export const sentGateMessages = new Set<string>();
+
+export let memoryAfkState = {
+  isAfk: false,
+  reason: "Away from keyboard",
+  startTime: 0
+};
+
+export async function getApprovalState(jid: string): Promise<{ approved: boolean; stopped: boolean }> {
+  if (prismaConnected) {
+    try {
+      const record = await prisma.chatApproval.findUnique({ where: { jid } });
+      if (record) {
+        return { approved: record.approved, stopped: record.stopped };
+      }
+    } catch (err) {
+      customLogger.error(`Error reading chat state for ${jid} from db`, err);
+    }
+  }
+  return fallbackChatState.get(jid) || { approved: false, stopped: false };
+}
+
+export async function setApprovalState(jid: string, state: { approved: boolean; stopped: boolean }): Promise<void> {
+  if (prismaConnected) {
+    try {
+      await prisma.chatApproval.upsert({
+        where: { jid },
+        update: { approved: state.approved, stopped: state.stopped },
+        create: { jid, approved: state.approved, stopped: state.stopped }
+      });
+      return;
+    } catch (err) {
+      customLogger.error(`Error writing chat state for ${jid} to db`, err);
+    }
+  }
+  fallbackChatState.set(jid, state);
+}
+
+export function getDynamicGreeting(): string {
+  // Compute local time in Asia/Kolkata (IST: UTC + 5:30)
+  const now = new Date();
+  const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
+  const istTime = new Date(utc + (3600000 * 5.5));
+  
+  const hour = istTime.getHours();
+  const minute = istTime.getMinutes();
+  const timeVal = hour * 100 + minute;
+
+  if (timeVal >= 500 && timeVal < 1200) {
+    return "Good morning";
+  } else if (timeVal >= 1200 && timeVal < 1700) {
+    return "Good afternoon";
+  } else {
+    return "Good evening";
+  }
+}
+
+export async function getAfkState(): Promise<{ isAfk: boolean; reason: string; startTime: number }> {
+  if (redisConnected) {
+    try {
+      const data = await redis.get('ultron:afk');
+      if (data) {
+        return JSON.parse(data);
+      }
+    } catch (err) {
+      customLogger.error('Failed to read AFK state from Redis', err);
+    }
+  }
+  return memoryAfkState;
+}
+
+export async function setAfkState(isAfk: boolean, reason: string, startTime: number): Promise<void> {
+  const state = { isAfk, reason, startTime };
+  if (redisConnected) {
+    try {
+      await redis.set('ultron:afk', JSON.stringify(state));
+    } catch (err) {
+      customLogger.error('Failed to write AFK state to Redis', err);
+    }
+  }
+  memoryAfkState = state;
+}
+
+export function formatAfkDuration(ms: number): string {
+  const seconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+
+  const minsPart = minutes % 60;
+  const hoursPart = hours;
+
+  const parts: string[] = [];
+  if (hoursPart > 0) {
+    parts.push(`${hoursPart} hour${hoursPart > 1 ? 's' : ''}`);
+  }
+  if (minsPart > 0 || parts.length === 0) {
+    parts.push(`${minsPart} minute${minsPart !== 1 ? 's' : ''}`);
+  }
+  return parts.join(' ');
+}
 
 function ensureDirectories(): void {
   const authDir = path.join(process.cwd(), 'auth');
@@ -193,16 +370,16 @@ async function initializeServices(): Promise<void> {
   ensureDirectories();
   try {
     await prisma.$connect();
-    customLogger.system('Prisma connected');
+    prismaConnected = true;
   } catch (error) {
-    customLogger.warn('Prisma unavailable, continuing without DB', error);
+    // Keep it false
   }
 
   try {
     await initRedis();
-    customLogger.system('Redis connected');
+    redisConnected = true;
   } catch (error) {
-    customLogger.warn('Redis unavailable, continuing without Redis', error);
+    // Keep it false
   }
 }
 
@@ -377,37 +554,30 @@ async function createPrismaAuthState(): Promise<any> {
   };
 }
 
-async function routeMessage(message: any): Promise<void> {
-  const messageTimestampMs = Number(message?.messageTimestamp) * 1000;
-  const messageId = message?.key?.id;
-  if (messageId && processedMessageIds.has(messageId)) {
-    return;
-  }
-  if (messageTimestampMs && messageTimestampMs < bootTimestampMs) {
-    return;
-  }
-  if (messageId) {
-    processedMessageIds.add(messageId);
-  }
-
-  messagesReceived += 1;
+export async function routeMessage(message: any): Promise<void> {
+  if (!socket) return;
   const text = extractText(message);
   const fromMe = message?.key?.fromMe === true;
+  const isOwnerCommand = fromMe && text.trim().startsWith('!');
 
-  if (fromMe) {
-    if (!text.startsWith('!')) {
-      return;
+  if (isOwnerCommand) {
+    const command = text.trim().slice(1).split(/\s+/)[0]?.toLowerCase() ?? '';
+    const chatJid = message?.key?.remoteJid;
+    if (!chatJid) return;
+
+    // Deactivate AFK in background asynchronously to not block execution
+    const isAfkCommand = command === 'afk';
+    if (!isAfkCommand) {
+      getAfkState().then(async (afkState) => {
+        if (afkState.isAfk) {
+          await setAfkState(false, "", 0);
+          customLogger.system("AFK Mode deactivated automatically.");
+        }
+      }).catch(() => {});
     }
 
-    const command = text.trim().slice(1).split(/\s+/)[0]?.toLowerCase() ?? '';
-    const chatJid = message?.key?.remoteJid ?? message?.key?.participant;
-    if (!chatJid || !socket) return;
-
     const startedAt = Date.now();
-    const placeholder = `⏳ Running !${command}...`;
-    const sentMessage = await socket.sendMessage(chatJid, { text: placeholder });
-    const editKey = sentMessage?.key;
-
+    const editKey = message?.key;
     let success = false;
     try {
       switch (command) {
@@ -471,6 +641,54 @@ async function routeMessage(message: any): Promise<void> {
           success = true;
           break;
         }
+        case 'approve': {
+          const targetJid = chatJid;
+          if (!targetJid || !targetJid.endsWith('@s.whatsapp.net')) {
+            const finalText = '❌ Please run this command in a direct message chat.';
+            if (editKey && socket) {
+              await socket.sendMessage(chatJid, { text: finalText, edit: editKey });
+            }
+            success = true;
+            break;
+          }
+          await setApprovalState(targetJid, { approved: true, stopped: false });
+          const finalText = `✅ *Chat Approved*: AI Auto-Response is now ACTIVE for this chat.`;
+          if (editKey && socket) {
+            await socket.sendMessage(chatJid, { text: finalText, edit: editKey });
+          }
+          success = true;
+          break;
+        }
+        case 'stop': {
+          const targetJid = chatJid;
+          if (!targetJid || !targetJid.endsWith('@s.whatsapp.net')) {
+            const finalText = '❌ Please run this command in a direct message chat.';
+            if (editKey && socket) {
+              await socket.sendMessage(chatJid, { text: finalText, edit: editKey });
+            }
+            success = true;
+            break;
+          }
+          await setApprovalState(targetJid, { approved: false, stopped: true });
+          const finalText = `🛑 *AI Deactivated*: Auto-Response has been paused for this chat. Shifting to manual control.`;
+          if (editKey && socket) {
+            await socket.sendMessage(chatJid, { text: finalText, edit: editKey });
+          }
+          success = true;
+          break;
+        }
+        case 'afk': {
+          const args = text.trim().slice(1).split(/\s+/).slice(1);
+          const reason = args.join(' ') || 'Away from keyboard';
+          await setAfkState(true, reason, Date.now());
+          customLogger.system(`AFK Mode activated: ${reason}`);
+          const finalText = `💤 *ULTRON OS: AFK Mode Activated*\nReason: ${reason}`;
+          if (editKey && socket) {
+            await socket.sendMessage(chatJid, { text: finalText, edit: editKey });
+          }
+          success = true;
+          break;
+        }
         case 'update': {
           const finalText = 'Update check not yet implemented — coming in a later phase.';
           if (editKey) {
@@ -480,6 +698,41 @@ async function routeMessage(message: any): Promise<void> {
           break;
         }
         default: {
+          const runtime = new PluginRuntime(process.env.OWNER_JID || 'owner');
+          const args = text.trim().slice(1).split(/\s+/).slice(1);
+          try {
+            const responseText = await runtime.dispatch(command, {
+              sender: message.key.fromMe ? (process.env.OWNER_JID || 'owner') : (message.key.participant || chatJid),
+              owner: process.env.OWNER_JID || 'owner',
+              args,
+              editMessage: async (newText: string) => {
+                if (editKey && socket) {
+                  await socket.sendMessage(chatJid, { text: newText, edit: editKey });
+                }
+              }
+            } as any);
+
+            if (responseText && responseText !== "Owner-only command." && !responseText.startsWith("Unknown command:")) {
+              if (editKey && socket) {
+                await socket.sendMessage(chatJid, { text: responseText, edit: editKey });
+              }
+              success = true;
+            } else if (responseText === "Owner-only command.") {
+              if (editKey && socket) {
+                await socket.sendMessage(chatJid, { text: "❌ Owner-only command.", edit: editKey });
+              }
+              success = true;
+            } else {
+              if (editKey && socket) {
+                await socket.sendMessage(chatJid, { text: `❌ Unknown command: !${command}`, edit: editKey });
+              }
+            }
+          } catch (err: any) {
+            customLogger.error(`Plugin execution failed for !${command}`, err);
+            if (editKey && socket) {
+              await socket.sendMessage(chatJid, { text: `❌ Error: ${err.message || err}`, edit: editKey });
+            }
+          }
           break;
         }
       }
@@ -497,9 +750,99 @@ async function routeMessage(message: any): Promise<void> {
     return;
   }
 
+  // Normal message flow (non-owner command):
+  const messageTimestampMs = Number(message?.messageTimestamp) * 1000;
+  const messageId = message?.key?.id;
+  if (messageId && processedMessageIds.has(messageId)) {
+    return;
+  }
+  if (messageTimestampMs && messageTimestampMs < bootTimestampMs) {
+    return;
+  }
+  if (messageId) {
+    processedMessageIds.add(messageId);
+  }
+
+  messagesReceived += 1;
+
+  if (fromMe) {
+    // If it's a standard message from me (not a command), check and deactivate AFK in background
+    getAfkState().then(async (afkState) => {
+      if (afkState.isAfk) {
+        await setAfkState(false, "", 0);
+        customLogger.system("AFK Mode deactivated automatically.");
+      }
+    }).catch(() => {});
+    return;
+  }
+
   const sender = message?.key?.remoteJid ?? 'unknown';
   const cleanSender = sender.split('@')[0];
   customLogger.whatsapp(`Incoming from ${cleanSender}: ${text}`);
+
+  const senderJid = message?.key?.participant || sender;
+  const isOwner = fromMe || senderJid === (process.env.OWNER_JID || 'owner');
+
+  if (isOwner) {
+    return;
+  }
+
+  const isDm = sender.endsWith('@s.whatsapp.net');
+  const isGroup = sender.endsWith('@g.us');
+  const botJid = socket?.user?.id ? jidNormalizedUser(socket.user.id) : '';
+
+  // Mentions check in group chats
+  const isMentioned = isGroup && (
+    message.message?.extendedTextMessage?.contextInfo?.mentionedJid?.includes(botJid) ||
+    text.toLowerCase().includes('ultron') ||
+    text.includes(botJid.split('@')[0])
+  );
+
+  // 1. Intercept for AFK if active
+  const afkState = await getAfkState();
+  if (afkState.isAfk && (isDm || isMentioned)) {
+    const durationStr = formatAfkDuration(Date.now() - afkState.startTime);
+    const afkResponse = `⏳ *Aayush is currently AFK* ────────────────\n📝 *Reason:* ${afkState.reason}\n⏰ *Away for:* ${durationStr}\n\n_Please leave your message. The system will alert him when he returns._`;
+    try {
+      await socket.sendMessage(sender, { text: afkResponse });
+    } catch (err) {
+      customLogger.error(`Failed to send AFK reply to ${sender}`, err);
+    }
+    return;
+  }
+
+  // 2. DM Gating logic
+  if (isDm) {
+    const chatState = await getApprovalState(sender);
+    if (chatState.stopped) {
+      // Manual control deactivates AI/Gate responses
+      return;
+    }
+
+    if (chatState.approved) {
+      // Approved: Auto AI response
+      if (!text.trim()) return;
+      customLogger.system(`Generating auto AI response for approved chat ${cleanSender}...`);
+      try {
+        const { text: aiResponse } = await generateAiResponse(text);
+        await socket.sendMessage(sender, { text: aiResponse });
+      } catch (err: any) {
+        customLogger.error(`Auto AI response failed for ${cleanSender}`, err);
+      }
+    } else {
+      // Unapproved: Send exactly ONE gate greeting message
+      if (!sentGateMessages.has(sender)) {
+        sentGateMessages.add(sender);
+        const greeting = getDynamicGreeting();
+        const gateText = `_${greeting}! My master is busy with some stuff. Please drop your message if it's too urgent or else wait until my master responds._`;
+        try {
+          await socket.sendMessage(sender, { text: gateText });
+        } catch (err) {
+          customLogger.error(`Failed to send gate message to ${cleanSender}`, err);
+        }
+      }
+    }
+  }
 }
 
 async function closeExistingSocket(): Promise<void> {
@@ -537,10 +880,18 @@ async function startSocket(): Promise<void> {
     }
 
     const thisSocketId = ++activeSocketId;
-    customLogger.system('Starting ULTRON WhatsApp session...');
     if (!authState) {
       authState = await createPrismaAuthState();
     }
+    printBanner();
+    printStatusTable(
+      prismaConnected ? 'connected' : 'disconnected',
+      redisConnected ? 'connected' : 'disconnected',
+      authState?.state?.creds?.me?.id || ''
+    );
+    customLogger.system('📦 Loading Core Engine... [SUCCESS]');
+    customLogger.system('⚡ Loading AI Failover... [SUCCESS]');
+    customLogger.system('Starting ULTRON WhatsApp session...');
     const { state, saveCreds } = authState;
     const { version } = await fetchLatestBaileysVersion();
     const currentSocket = makeWASocket({
@@ -588,17 +939,52 @@ async function startSocket(): Promise<void> {
         }
         reconnecting = false;
         customLogger.whatsapp('Connected');
+        const userId = currentSocket.user?.id;
+        customLogger.system(`🔑 Authorized as: ${userId || 'unknown'}`);
+
+        if (!hasSentBootNotification && userId) {
+          hasSentBootNotification = true;
+          const normalizedJid = jidNormalizedUser(userId);
+
+          // Get the dynamic count of plugins
+          const runtime = new PluginRuntime(process.env.OWNER_JID || 'owner');
+          const pluginCount = runtime.getPluginList().length;
+
+          // Parse and format the AI Failover Priority
+          const priorityStr = process.env.AI_PROVIDER_PRIORITY || "Gemini,OpenAI,Claude,OpenRouter,DeepSeek,Groq,Mistral,Cohere";
+          const priorityFormatted = priorityStr.split(',').map(p => p.trim()).filter(Boolean).join(' -> ');
+
+          const notificationText = [
+            `*元 ULTRON OS ONLINE* ────────────────`,
+            `🤖 *Status:* Core Systems Operational`,
+            `⚡ *Environment:* Koyeb Production`,
+            `🛠️ *Plugins Loaded:* ${pluginCount}`,
+            `🧠 *AI Failover:* Active (Priority: ${priorityFormatted})`,
+            ``,
+            `_Ready for inputs. Try sending !help to test execution._`
+          ].join('\n');
+
+          // Send message directly to owner
+          currentSocket.sendMessage(normalizedJid, { text: notificationText }).catch(err => {
+            customLogger.error('Failed to send startup notification', err);
+          });
+        }
       }
     });
 
     currentSocket.ev.on('creds.update', saveCreds);
 
     currentSocket.ev.on('messages.upsert', async ({ messages, type }: { messages: any[]; type: string }) => {
-      if (type !== 'notify') {
-        return;
-      }
       for (const message of messages) {
         if (!message.message) continue;
+        const text = extractText(message);
+        const fromMe = message?.key?.fromMe === true;
+        const isOwnerCommand = fromMe && text.trim().startsWith('!');
+
+        if (type !== 'notify' && !isOwnerCommand) {
+          continue;
+        }
+
         await routeMessage(message);
       }
     });
@@ -609,7 +995,9 @@ async function startSocket(): Promise<void> {
   }
 }
 
-startSocket().catch((error) => {
-  customLogger.error('Startup failed', error);
-  process.exit(1);
-});
+if (require.main === module) {
+  startSocket().catch((error) => {
+    customLogger.error('Startup failed', error);
+    process.exit(1);
+  });
+}
