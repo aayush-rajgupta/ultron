@@ -20,6 +20,7 @@ export interface PluginContext {
   owner: string;
   state: RuntimeState;
   editMessage?: (text: string) => Promise<void>;
+  chatJid?: string;
 }
 
 export interface RuntimeState {
@@ -75,6 +76,7 @@ export class PluginRuntime {
       owner: this.owner,
       state: this.state,
       editMessage: (ctx as any).editMessage,
+      chatJid: (ctx as any).chatJid,
     } as PluginContext;
 
     if (plugin.commands.some((c) => c.ownerOnly) && fullCtx.sender !== this.owner) {
@@ -103,6 +105,7 @@ export class PluginRuntime {
           { name: "help", description: "List commands", usage: "!help [plugin]", ownerOnly: true },
           { name: "restart", description: "Gracefully restart the process", usage: "!restart", ownerOnly: true },
           { name: "update", description: "Check for updates", usage: "!update [confirm]", ownerOnly: true },
+          { name: "neofetch", description: "System telemetry info", usage: "!neofetch", ownerOnly: true },
         ],
         execute: async (ctx) => {
           if (ctx.command === "ping") {
@@ -110,15 +113,45 @@ export class PluginRuntime {
             return `PONG ${latency}ms`;
           }
           if (ctx.command === "alive") {
-            const uptime = this.formatDuration(ctx.state.uptimeMs || Date.now() - ctx.state.startTime);
+            const { getPrismaStatus, getRedisStatus, getAfkState } = await import('./main');
+            const prismaStatus = await getPrismaStatus();
+            const redisStatus = await getRedisStatus();
+            const afkState = await getAfkState();
+            
+            const totalSeconds = Math.floor(process.uptime());
+            const hours = Math.floor(totalSeconds / 3600);
+            const minutes = Math.floor((totalSeconds % 3600) / 60);
+            const secs = totalSeconds % 60;
+            const uptimeStr = `${hours}h ${minutes}m ${secs}s`;
+
+            const afkStr = afkState.isAfk ? `Active (Reason: ${afkState.reason})` : `Inactive`;
+
             return [
-              "═ ULTRON STATUS ═",
-              `Name: ${"ULTRON"}`,
-              `Uptime: ${uptime}`,
-              `Plugins: ${ctx.state.pluginCount}`,
-              `AI Provider: ${ctx.state.aiProvider}`,
-              `Version: ${ctx.state.version}`,
-              `Platform: ${ctx.state.platform}`,
+              "═ *ULTRON STATUS* ═",
+              `⏱ *Uptime:* ${uptimeStr}`,
+              `🗄 *Database:* ${prismaStatus}`,
+              `⚡ *Cache:* ${redisStatus}`,
+              `💤 *AFK State:* ${afkStr}`,
+              `🛡 *DM Gate:* Enabled (Greetings & AI Chatbot Active)`,
+              `🛠 Plugins: ${ctx.state.pluginCount}`,
+              `🧠 AI Provider: ${ctx.state.aiProvider}`
+            ].join("\n");
+          }
+          if (ctx.command === "neofetch") {
+            const os = await import('os');
+            const totalMem = Math.round(os.totalmem() / 1024 / 1024);
+            const freeMem = Math.round(os.freemem() / 1024 / 1024);
+            const usedMem = totalMem - freeMem;
+            const arch = os.arch();
+            const platform = os.platform();
+            const nodeVersion = process.version;
+
+            return [
+              "💻 *ULTRON OS NEOFETCH*",
+              `🖥️ *Platform:* ${platform}`,
+              `⚙️ *Architecture:* ${arch}`,
+              `🟢 *NodeJS Version:* ${nodeVersion}`,
+              `💾 *RAM Usage:* ${usedMem} MB / ${totalMem} MB`
             ].join("\n");
           }
           if (ctx.command === "uptime") {
@@ -174,6 +207,127 @@ export class PluginRuntime {
           } catch (err: any) {
             return err.message || String(err);
           }
+        }
+      },
+      {
+        name: "gate",
+        category: "Gate",
+        description: "DM Gate and AFK Control commands.",
+        commands: [
+          { name: "approve", description: "Approve a JID for AI chatbot", usage: "!approve", ownerOnly: true },
+          { name: "stop", description: "Pause AI chatbot for a JID", usage: "!stop", ownerOnly: true },
+          { name: "afk", description: "Activate AFK mode", usage: "!afk [reason]", ownerOnly: true },
+        ],
+        execute: async (ctx) => {
+          const { setApprovalState, setAfkState } = await import('./main');
+          if (ctx.command === 'approve') {
+            const targetJid = ctx.chatJid || ctx.sender;
+            if (!targetJid || !targetJid.endsWith('@s.whatsapp.net')) {
+              return '❌ Please run this command in a direct message chat.';
+            }
+            await setApprovalState(targetJid, { approved: true, stopped: false });
+            return `✅ *Chat Approved*: AI Auto-Response is now ACTIVE for this chat.`;
+          }
+          if (ctx.command === 'stop') {
+            const targetJid = ctx.chatJid || ctx.sender;
+            if (!targetJid || !targetJid.endsWith('@s.whatsapp.net')) {
+              return '❌ Please run this command in a direct message chat.';
+            }
+            await setApprovalState(targetJid, { approved: false, stopped: true });
+            return `🛑 *AI Deactivated*: Auto-Response has been paused for this chat. Shifting to manual control.`;
+          }
+          if (ctx.command === 'afk') {
+            const reason = ctx.args.join(' ') || 'Away from keyboard';
+            await setAfkState(true, reason, Date.now());
+            return `💤 *ULTRON OS: AFK Mode Activated*\nReason: ${reason}`;
+          }
+          return "Unsupported command";
+        }
+      },
+      {
+        name: "animations",
+        category: "Animations",
+        description: "Visual text animations and typography distortions.",
+        commands: [
+          { name: "type", description: "Typewriter typing animation", usage: "!type <text>", ownerOnly: true },
+          { name: "loading", description: "Progress bar animation", usage: "!loading", ownerOnly: true },
+          { name: "clock", description: "Clocks iteration followed by server time", usage: "!clock", ownerOnly: true },
+          { name: "vapor", description: "Vaporwave text spaced out", usage: "!vapor <text>", ownerOnly: true },
+          { name: "mock", description: "Alternating mock casing", usage: "!mock <text>", ownerOnly: true },
+          { name: "slap", description: "Humorous slap action generator", usage: "!slap <@mention>", ownerOnly: true },
+        ],
+        execute: async (ctx) => {
+          if (ctx.command === "type") {
+            const textToType = ctx.args.join(" ");
+            if (!textToType) return "Usage: !type <text>";
+            if (ctx.editMessage) {
+              let currentText = "";
+              for (let i = 0; i < textToType.length; i++) {
+                currentText += textToType[i];
+                await ctx.editMessage(`${currentText}|`);
+                await new Promise((resolve) => setTimeout(resolve, 150));
+              }
+            }
+            return textToType;
+          }
+          if (ctx.command === "loading") {
+            if (ctx.editMessage) {
+              const frames = [
+                { bar: "[░░░░░░░░░░]", pct: 0 },
+                { bar: "[██░░░░░░░░]", pct: 20 },
+                { bar: "[████░░░░░░]", pct: 40 },
+                { bar: "[██████░░░░]", pct: 60 },
+                { bar: "[████████░░]", pct: 80 },
+                { bar: "[██████████]", pct: 100 },
+              ];
+              for (const frame of frames) {
+                await ctx.editMessage(`⏳ *Loading:* ${frame.bar} ${frame.pct}%`);
+                await new Promise((resolve) => setTimeout(resolve, 200));
+              }
+            }
+            return "System fully initialized.";
+          }
+          if (ctx.command === "clock") {
+            const clocks = ["🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘", "🕙", "🕚", "🕛"];
+            if (ctx.editMessage) {
+              for (const clock of clocks) {
+                await ctx.editMessage(`🕒 Time Matrix: ${clock}`);
+                await new Promise((resolve) => setTimeout(resolve, 150));
+              }
+            }
+            const now = new Date();
+            const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
+            const istTime = new Date(utc + (3600000 * 5.5));
+            const pad = (n: number) => n.toString().padStart(2, '0');
+            const timeStr = `${pad(istTime.getHours())}:${pad(istTime.getMinutes())}:${pad(istTime.getSeconds())}`;
+            return `🕒 *Live Server Time (IST):* ${timeStr}`;
+          }
+          if (ctx.command === "vapor") {
+            const textToDistort = ctx.args.join(" ");
+            if (!textToDistort) return "Usage: !vapor <text>";
+            return textToDistort.split("").join(" ");
+          }
+          if (ctx.command === "mock") {
+            const textToMock = ctx.args.join(" ");
+            if (!textToMock) return "Usage: !mock <text>";
+            return textToMock
+              .split("")
+              .map((char) => (Math.random() > 0.5 ? char.toUpperCase() : char.toLowerCase()))
+              .join("");
+          }
+          if (ctx.command === "slap") {
+            const target = ctx.args.join(" ") || "someone";
+            const slaps = [
+              `slapped ${target} with a mechanical keyboard (Cherry MX Blues included)! ⌨️`,
+              `hit ${target} by a database migration error! 💥`,
+              `drop-kicked ${target} into a production server rack! 🖥️`,
+              `slapped ${target} with a hot cup of black coffee! ☕`,
+              `slapped ${target} with a giant piece of server RAM! 💾`
+            ];
+            const randomSlap = slaps[Math.floor(Math.random() * slaps.length)];
+            return `Aayush ${randomSlap}`;
+          }
+          return "Unsupported command";
         }
       },
     ];

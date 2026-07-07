@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as mainModule from '../src/main';
+import { PluginRuntime } from '../src/plugins';
 
 const originalEnv = { ...process.env };
 const originalFetch = globalThis.fetch;
@@ -181,4 +182,56 @@ test('AFK - auto-reply and deactivation', async () => {
 
   const afkState = await mainModule.getAfkState();
   assert.equal(afkState.isAfk, false); // AFK state deactivated!
+});
+
+test('PluginRuntime - dispatch approve, stop, and afk commands', async () => {
+  const runtime = new PluginRuntime('owner');
+
+  // Test afk command execution
+  const afkResult = await runtime.dispatch('afk', {
+    sender: 'owner',
+    owner: 'owner',
+    args: ['Working', 'on', 'tests']
+  } as any);
+  assert.match(afkResult, /Activated/);
+  assert.match(afkResult, /Working on tests/);
+
+  const afkState = await mainModule.getAfkState();
+  assert.equal(afkState.isAfk, true);
+  assert.equal(afkState.reason, 'Working on tests');
+
+  // Test approve command execution (should fail if not direct message)
+  const approveFail = await runtime.dispatch('approve', {
+    sender: 'owner',
+    owner: 'owner',
+    chatJid: '12345@g.us',
+    args: []
+  } as any);
+  assert.match(approveFail, /direct message chat/);
+
+  // Test approve command execution (success)
+  const approveResult = await runtime.dispatch('approve', {
+    sender: 'owner',
+    owner: 'owner',
+    chatJid: '919999999999@s.whatsapp.net',
+    args: []
+  } as any);
+  assert.match(approveResult, /ACTIVE/);
+
+  const approvalState = await mainModule.getApprovalState('919999999999@s.whatsapp.net');
+  assert.equal(approvalState.approved, true);
+  assert.equal(approvalState.stopped, false);
+
+  // Test stop command execution (success)
+  const stopResult = await runtime.dispatch('stop', {
+    sender: 'owner',
+    owner: 'owner',
+    chatJid: '919999999999@s.whatsapp.net',
+    args: []
+  } as any);
+  assert.match(stopResult, /paused/);
+
+  const stoppedState = await mainModule.getApprovalState('919999999999@s.whatsapp.net');
+  assert.equal(stoppedState.approved, false);
+  assert.equal(stoppedState.stopped, true);
 });

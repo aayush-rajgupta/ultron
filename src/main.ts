@@ -406,7 +406,7 @@ function extractText(message: any): string {
   ).trim();
 }
 
-async function getPrismaStatus(): Promise<string> {
+export async function getPrismaStatus(): Promise<string> {
   try {
     await prisma.$queryRaw`SELECT 1`;
     return 'connected';
@@ -415,7 +415,7 @@ async function getPrismaStatus(): Promise<string> {
   }
 }
 
-async function getRedisStatus(): Promise<string> {
+export async function getRedisStatus(): Promise<string> {
   try {
     await redis.ping();
     return 'connected';
@@ -592,10 +592,35 @@ export async function routeMessage(message: any): Promise<void> {
           break;
         }
         case 'alive': {
-          const [prismaStatus, redisStatus] = await Promise.all([getPrismaStatus(), getRedisStatus()]);
-          const uptime = formatUptime(process.uptime());
-          const finalText = [`*ULTRON is alive* 🟢`, `Uptime: ${uptime}`, `Database: ${prismaStatus}`, `Cache: ${redisStatus}`].join('\n');
-          if (editKey) {
+          const [prismaStatus, redisStatus, afkState] = await Promise.all([
+            getPrismaStatus(),
+            getRedisStatus(),
+            getAfkState()
+          ]);
+          const totalSeconds = Math.floor(process.uptime());
+          const hours = Math.floor(totalSeconds / 3600);
+          const minutes = Math.floor((totalSeconds % 3600) / 60);
+          const secs = totalSeconds % 60;
+          const uptimeStr = `${hours}h ${minutes}m ${secs}s`;
+
+          const afkStr = afkState.isAfk ? `Active (Reason: ${afkState.reason})` : `Inactive`;
+
+          const runtime = new PluginRuntime(process.env.OWNER_JID || 'owner');
+          const pluginCount = runtime.getPluginList().length;
+          const priorityStr = process.env.AI_PROVIDER_PRIORITY || "Gemini,OpenAI,Claude,OpenRouter,DeepSeek,Groq,Mistral,Cohere";
+          const aiProvider = priorityStr.split(',')[0]?.trim() || 'Gemini';
+
+          const finalText = [
+            `═ *ULTRON STATUS* ═`,
+            `⏱ *Uptime:* ${uptimeStr}`,
+            `🗄 *Database:* ${prismaStatus}`,
+            `⚡ *Cache:* ${redisStatus}`,
+            `💤 *AFK State:* ${afkStr}`,
+            `🛡 *DM Gate:* Enabled (Greetings & AI Chatbot Active)`,
+            `🛠 Plugins: ${pluginCount}`,
+            `🧠 AI Provider: ${aiProvider}`
+          ].join('\n');
+          if (editKey && socket) {
             await socket.sendMessage(chatJid, { text: finalText, edit: editKey });
           }
           success = true;
@@ -683,7 +708,7 @@ export async function routeMessage(message: any): Promise<void> {
           const reason = args.join(' ') || 'Away from keyboard';
           await setAfkState(true, reason, Date.now());
           customLogger.system(`AFK Mode activated: ${reason}`);
-          const finalText = `💤 *ULTRON OS: AFK Mode Activated*\nReason: ${reason}`;
+          const finalText = `💤 *ULTRON OS: AFK Mode Activated* \nReason: ${reason}`;
           if (editKey && socket) {
             await socket.sendMessage(chatJid, { text: finalText, edit: editKey });
           }
@@ -706,6 +731,7 @@ export async function routeMessage(message: any): Promise<void> {
               sender: message.key.fromMe ? (process.env.OWNER_JID || 'owner') : (message.key.participant || chatJid),
               owner: process.env.OWNER_JID || 'owner',
               args,
+              chatJid,
               editMessage: async (newText: string) => {
                 if (editKey && socket) {
                   await socket.sendMessage(chatJid, { text: newText, edit: editKey });
@@ -793,11 +819,47 @@ export async function routeMessage(message: any): Promise<void> {
   const botJid = socket?.user?.id ? jidNormalizedUser(socket.user.id) : '';
 
   // Mentions check in group chats
+  const botId = botJid ? botJid.split('@')[0] : '';
   const isMentioned = isGroup && (
-    message.message?.extendedTextMessage?.contextInfo?.mentionedJid?.includes(botJid) ||
+    (botJid && message.message?.extendedTextMessage?.contextInfo?.mentionedJid?.includes(botJid)) ||
     text.toLowerCase().includes('ultron') ||
-    text.includes(botJid.split('@')[0])
+    (botId && text.includes(botId))
   );
+
+  // Central Logging Hook
+  const logGroupJid = process.env.LOG_GROUP_JID;
+  if (logGroupJid && logGroupJid !== sender) {
+    let shouldLog = false;
+    let logReason = "";
+
+    if (isDm) {
+      const chatState = await getApprovalState(sender);
+      if (!chatState.approved && !chatState.stopped) {
+        shouldLog = true;
+        logReason = "Incoming DM from unapproved user";
+      }
+    } else if (isGroup && isMentioned) {
+      shouldLog = true;
+      logReason = "Explicit group mention";
+    }
+
+    if (shouldLog) {
+      const cleanSender = sender.split('@')[0];
+      const pushName = message.pushName || "Unknown";
+      const logMessage = [
+        `🔔 *ULTRON LOG ENGINE* ────────────────`,
+        `🚨 *Reason:* ${logReason}`,
+        `👤 *User:* ${pushName} (${cleanSender})`,
+        `💬 *Message:* ${text}`,
+      ].join('\n');
+
+      if (socket) {
+        socket.sendMessage(logGroupJid, { text: logMessage }).catch(err => {
+          customLogger.error(`Failed to forward message to log group ${logGroupJid}`, err);
+        });
+      }
+    }
+  }
 
   // 1. Intercept for AFK if active
   const afkState = await getAfkState();
