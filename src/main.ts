@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
+import http from 'node:http';
 import makeWASocket, {
   Browsers,
   DisconnectReason,
@@ -865,7 +866,25 @@ async function closeExistingSocket(): Promise<void> {
   }
 }
 
+let dummyServerStarted = false;
+
+function startDummyServer(): void {
+  if (dummyServerStarted) return;
+  dummyServerStarted = true;
+
+  const port = process.env.PORT || '8000';
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('ULTRON OS is active.');
+  });
+
+  server.listen(Number(port), () => {
+    customLogger.system(`🌐 Dummy web server listening on port ${port} [SUCCESS]`);
+  });
+}
+
 async function startSocket(): Promise<void> {
+  startDummyServer();
   try {
     if (reconnecting) return;
     reconnecting = true;
