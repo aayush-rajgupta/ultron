@@ -572,9 +572,26 @@ async function createPrismaAuthState(): Promise<any> {
 export function ensureJidSuffix(jid: string): string {
   try {
     if (!jid || typeof jid !== 'string') return '';
-    const clean = jid.trim();
+    let clean = jid.trim();
     if (!clean) return '';
-    if (clean.includes('@')) return jidNormalizedUser(clean);
+
+    // If it contains c.us, replace with s.whatsapp.net
+    if (clean.includes('@c.us')) {
+      clean = clean.replace('@c.us', '@s.whatsapp.net');
+    }
+
+    // Check if JID has a standard suffix
+    if (clean.endsWith('@s.whatsapp.net') || clean.endsWith('@g.us')) {
+      // Strip any device IDs if present (e.g. 12345:1@s.whatsapp.net -> 12345@s.whatsapp.net)
+      const parts = clean.split('@');
+      const userPart = parts[0].split(':')[0];
+      return `${userPart}@${parts[1]}`;
+    }
+
+    if (clean.includes('@')) {
+      return jidNormalizedUser(clean);
+    }
+
     return `${clean}@s.whatsapp.net`;
   } catch (err) {
     customLogger.warn(`Invalid JID format: "${jid}"`);
@@ -616,7 +633,7 @@ export async function routeMessage(message: any): Promise<void> {
         case 'ping': {
           const latencyMs = Date.now() - startedAt;
           const finalText = `*Pong!* ${latencyMs}ms`;
-          await socket.sendMessage(normalizedChatJid, { text: finalText });
+          await socket.sendMessage(normalizedChatJid, { text: finalText, edit: message.key });
           success = true;
           break;
         }
@@ -649,13 +666,13 @@ export async function routeMessage(message: any): Promise<void> {
             `🛠 Plugins: ${pluginCount}`,
             `🧠 AI Provider: ${aiProvider}`
           ].join('\n');
-          await socket.sendMessage(normalizedChatJid, { text: finalText });
+          await socket.sendMessage(normalizedChatJid, { text: finalText, edit: message.key });
           success = true;
           break;
         }
         case 'uptime': {
           const finalText = `*Uptime*\n${formatUptime(process.uptime())}`;
-          await socket.sendMessage(normalizedChatJid, { text: finalText });
+          await socket.sendMessage(normalizedChatJid, { text: finalText, edit: message.key });
           success = true;
           break;
         }
@@ -670,7 +687,7 @@ export async function routeMessage(message: any): Promise<void> {
             `⚡ Cache: ${redisStatus}`,
             `📩 Messages received: ${messagesReceived}`,
           ].join('\n');
-          await socket.sendMessage(normalizedChatJid, { text: finalText });
+          await socket.sendMessage(normalizedChatJid, { text: finalText, edit: message.key });
           success = true;
           break;
         }
@@ -684,7 +701,7 @@ export async function routeMessage(message: any): Promise<void> {
             '- !help — this list',
             '- !update — check for updates (not yet implemented)',
           ].join('\n');
-          await socket.sendMessage(normalizedChatJid, { text: finalText });
+          await socket.sendMessage(normalizedChatJid, { text: finalText, edit: message.key });
           success = true;
           break;
         }
@@ -692,13 +709,13 @@ export async function routeMessage(message: any): Promise<void> {
           const targetJid = normalizedChatJid;
           if (!targetJid || !targetJid.endsWith('@s.whatsapp.net')) {
             const finalText = '❌ Please run this command in a direct message chat.';
-            await socket.sendMessage(normalizedChatJid, { text: finalText });
+            await socket.sendMessage(normalizedChatJid, { text: finalText, edit: message.key });
             success = true;
             break;
           }
           await setApprovalState(targetJid, { approved: true, stopped: false });
           const finalText = `✅ *Chat Approved*: AI Auto-Response is now ACTIVE for this chat.`;
-          await socket.sendMessage(normalizedChatJid, { text: finalText });
+          await socket.sendMessage(normalizedChatJid, { text: finalText, edit: message.key });
           success = true;
           break;
         }
@@ -706,13 +723,13 @@ export async function routeMessage(message: any): Promise<void> {
           const targetJid = normalizedChatJid;
           if (!targetJid || !targetJid.endsWith('@s.whatsapp.net')) {
             const finalText = '❌ Please run this command in a direct message chat.';
-            await socket.sendMessage(normalizedChatJid, { text: finalText });
+            await socket.sendMessage(normalizedChatJid, { text: finalText, edit: message.key });
             success = true;
             break;
           }
           await setApprovalState(targetJid, { approved: false, stopped: true });
           const finalText = `🛑 *AI Deactivated*: Auto-Response has been paused for this chat. Shifting to manual control.`;
-          await socket.sendMessage(normalizedChatJid, { text: finalText });
+          await socket.sendMessage(normalizedChatJid, { text: finalText, edit: message.key });
           success = true;
           break;
         }
@@ -722,28 +739,23 @@ export async function routeMessage(message: any): Promise<void> {
           await setAfkState(true, reason, Date.now());
           customLogger.system(`AFK Mode activated: ${reason}`);
           const finalText = `💤 *ULTRON OS: AFK Mode Activated* \nReason: ${reason}`;
-          await socket.sendMessage(normalizedChatJid, { text: finalText });
+          await socket.sendMessage(normalizedChatJid, { text: finalText, edit: message.key });
           success = true;
           break;
         }
         case 'update': {
           const finalText = 'Update check not yet implemented — coming in a later phase.';
-          await socket.sendMessage(normalizedChatJid, { text: finalText });
+          await socket.sendMessage(normalizedChatJid, { text: finalText, edit: message.key });
           success = true;
           break;
         }
         default: {
           const runtime = new PluginRuntime(ownerJid);
           const args = text.trim().slice(1).split(/\s+/).slice(1);
-          let activeMsgKey: any = null;
           try {
             const editMessage = async (newText: string) => {
-              if (!socket) return;
-              if (!activeMsgKey) {
-                const sent = await socket.sendMessage(normalizedChatJid, { text: newText });
-                activeMsgKey = sent?.key;
-              } else {
-                await socket.sendMessage(normalizedChatJid, { text: newText, edit: activeMsgKey });
+              if (socket) {
+                await socket.sendMessage(normalizedChatJid, { text: newText, edit: message.key });
               }
             };
 
@@ -756,30 +768,22 @@ export async function routeMessage(message: any): Promise<void> {
             } as any);
 
             if (responseText && responseText !== "Owner-only command." && !responseText.startsWith("Unknown command:")) {
-              if (activeMsgKey) {
-                await socket.sendMessage(normalizedChatJid, { text: responseText, edit: activeMsgKey });
-              } else {
-                await socket.sendMessage(normalizedChatJid, { text: responseText });
+              if (socket) {
+                await socket.sendMessage(normalizedChatJid, { text: responseText, edit: message.key });
               }
               success = true;
             } else if (responseText === "Owner-only command.") {
-              if (activeMsgKey) {
-                await socket.sendMessage(normalizedChatJid, { text: "❌ Owner-only command.", edit: activeMsgKey });
-              } else {
-                await socket.sendMessage(normalizedChatJid, { text: "❌ Owner-only command." });
+              if (socket) {
+                await socket.sendMessage(normalizedChatJid, { text: "❌ Owner-only command.", edit: message.key });
               }
               success = true;
             } else {
-              if (!activeMsgKey) {
-                await socket.sendMessage(normalizedChatJid, { text: `❌ Unknown command: !${command}` });
-              }
+              // No reply if command output was empty, or unhandled
             }
           } catch (err: any) {
             customLogger.error(`Plugin execution failed for !${command}`, err);
-            if (activeMsgKey) {
-              await socket.sendMessage(normalizedChatJid, { text: `❌ Error: ${err.message || err}`, edit: activeMsgKey });
-            } else {
-              await socket.sendMessage(normalizedChatJid, { text: `❌ Error: ${err.message || err}` });
+            if (socket) {
+              await socket.sendMessage(normalizedChatJid, { text: `❌ Error: ${err.message || err}`, edit: message.key });
             }
           }
           break;
