@@ -115,6 +115,18 @@ test('Central Logger Hook - forwards DM from unapproved user to LOG_GROUP_JID', 
   
   process.env.LOG_GROUP_JID = "1203630248@g.us";
 
+  // Mock OpenAI/AI call
+  process.env.AI_PROVIDER_PRIORITY = "OpenAI";
+  process.env.OPENAI_API_KEY = "mock-key";
+  globalThis.fetch = async (url, options) => {
+    return {
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: "AI Bouncer Response" } }]
+      })
+    } as any;
+  };
+
   // Incoming DM from unapproved user
   const msg = {
     key: { id: "msg-log-dm", remoteJid: "919999999999@s.whatsapp.net", fromMe: false },
@@ -128,7 +140,7 @@ test('Central Logger Hook - forwards DM from unapproved user to LOG_GROUP_JID', 
   const logMessage = sentMessages.find(m => m.jid === "1203630248@g.us");
 
   assert.ok(gateMessage);
-  assert.match(gateMessage.text, /busy with some stuff/);
+  assert.match(gateMessage.text, /AI Bouncer Response/);
 
   assert.ok(logMessage);
   assert.match(logMessage.text, /ULTRON LOG ENGINE/);
@@ -149,6 +161,18 @@ test('Central Logger Hook - forwards DM from unapproved user with @lid JID to LO
   
   process.env.LOG_GROUP_JID = "1203630248@g.us";
 
+  // Mock OpenAI/AI call
+  process.env.AI_PROVIDER_PRIORITY = "OpenAI";
+  process.env.OPENAI_API_KEY = "mock-key";
+  globalThis.fetch = async (url, options) => {
+    return {
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: "AI Bouncer Response" } }]
+      })
+    } as any;
+  };
+
   // Incoming DM from unapproved user with @lid JID
   const msg = {
     key: { id: "msg-log-dm-lid", remoteJid: "919999999999@lid", fromMe: false },
@@ -162,7 +186,7 @@ test('Central Logger Hook - forwards DM from unapproved user with @lid JID to LO
   const logMessage = sentMessages.find(m => m.jid === "1203630248@g.us");
 
   assert.ok(gateMessage);
-  assert.match(gateMessage.text, /busy with some stuff/);
+  assert.match(gateMessage.text, /AI Bouncer Response/);
 
   assert.ok(logMessage);
   assert.match(logMessage.text, /ULTRON LOG ENGINE/);

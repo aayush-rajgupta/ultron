@@ -224,15 +224,15 @@ export class PluginRuntime {
           const { setApprovalState, setAfkState } = await import('./main');
           if (ctx.command === 'approve') {
             const targetJid = ctx.chatJid || ctx.sender;
-            if (!targetJid || !targetJid.endsWith('@s.whatsapp.net')) {
+            if (!targetJid || targetJid.endsWith('@g.us') || targetJid.includes('broadcast')) {
               return '❌ Please run this command in a direct message chat.';
             }
             await setApprovalState(targetJid, { approved: true, stopped: false });
-            return `✅ *Chat Approved*: AI Auto-Response is now ACTIVE for this chat.`;
+            return `✅ Access Granted. AI Bouncer deactivated for this chat.`;
           }
           if (ctx.command === 'stop') {
             const targetJid = ctx.chatJid || ctx.sender;
-            if (!targetJid || !targetJid.endsWith('@s.whatsapp.net')) {
+            if (!targetJid || targetJid.endsWith('@g.us') || targetJid.includes('broadcast')) {
               return '❌ Please run this command in a direct message chat.';
             }
             await setApprovalState(targetJid, { approved: false, stopped: true });

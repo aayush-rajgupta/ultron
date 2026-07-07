@@ -50,7 +50,7 @@ test('getDynamicGreeting - computes correct timezone greeting (Asia/Kolkata)', (
   Date.prototype.getMinutes = originalGetMinutes;
 });
 
-test('DM Gating - unapproved sender receives exactly one gate message', async () => {
+test('DM Gating - unapproved sender triggers AI bouncer response', async () => {
   const sentMessages: { jid: string; text: string }[] = [];
   const mockSocket = {
     user: { id: "916263506758@s.whatsapp.net" },
@@ -61,7 +61,21 @@ test('DM Gating - unapproved sender receives exactly one gate message', async ()
   };
   mainModule.setSocket(mockSocket as any);
 
-  // First message from unapproved user
+  // Set user to unapproved
+  await mainModule.setApprovalState("919999999999@s.whatsapp.net", { approved: false, stopped: false });
+
+  // Mock OpenAI/AI call
+  process.env.AI_PROVIDER_PRIORITY = "OpenAI";
+  process.env.OPENAI_API_KEY = "mock-key";
+  globalThis.fetch = async (url, options) => {
+    return {
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: "AI Bouncer: Please wait for my master." } }]
+      })
+    } as any;
+  };
+
   const msg1 = {
     key: { id: "msg-unapproved-1", remoteJid: "919999999999@s.whatsapp.net", fromMe: false },
     message: { conversation: "hello" },
@@ -70,20 +84,10 @@ test('DM Gating - unapproved sender receives exactly one gate message', async ()
   await mainModule.routeMessage(msg1);
 
   assert.equal(sentMessages.length, 1);
-  assert.match(sentMessages[0].text, /busy with some stuff/);
-
-  // Second message from same user (should be deduplicated)
-  const msg2 = {
-    key: { id: "msg-unapproved-2", remoteJid: "919999999999@s.whatsapp.net", fromMe: false },
-    message: { conversation: "second ping" },
-    messageTimestamp: Math.floor((Date.now() + 10000) / 1000)
-  };
-  await mainModule.routeMessage(msg2);
-
-  assert.equal(sentMessages.length, 1); // still 1 message (deduplicated)
+  assert.equal(sentMessages[0].text, "AI Bouncer: Please wait for my master.");
 });
 
-test('DM Gating - approved sender triggers AI auto-response', async () => {
+test('DM Gating - approved sender is ignored (manual chat)', async () => {
   const sentMessages: { jid: string; text: string }[] = [];
   const mockSocket = {
     user: { id: "916263506758@s.whatsapp.net" },
@@ -97,18 +101,6 @@ test('DM Gating - approved sender triggers AI auto-response', async () => {
   // Approve the user
   await mainModule.setApprovalState("919999999999@s.whatsapp.net", { approved: true, stopped: false });
 
-  // Mock OpenAI/AI call
-  process.env.AI_PROVIDER_PRIORITY = "OpenAI";
-  process.env.OPENAI_API_KEY = "mock-key";
-  globalThis.fetch = async (url, options) => {
-    return {
-      ok: true,
-      json: async () => ({
-        choices: [{ message: { content: "AI Autoreply: Hello human!" } }]
-      })
-    } as any;
-  };
-
   const msg = {
     key: { id: "msg-approved-1", remoteJid: "919999999999@s.whatsapp.net", fromMe: false },
     message: { conversation: "What is up?" },
@@ -116,8 +108,7 @@ test('DM Gating - approved sender triggers AI auto-response', async () => {
   };
   await mainModule.routeMessage(msg);
 
-  assert.equal(sentMessages.length, 1);
-  assert.equal(sentMessages[0].text, "AI Autoreply: Hello human!");
+  assert.equal(sentMessages.length, 0); // ignored for manual chat
 });
 
 test('DM Gating - stopped sender receives no replies', async () => {
@@ -216,7 +207,7 @@ test('PluginRuntime - dispatch approve, stop, and afk commands', async () => {
     chatJid: '919999999999@s.whatsapp.net',
     args: []
   } as any);
-  assert.match(approveResult, /ACTIVE/);
+  assert.match(approveResult, /deactivated/);
 
   const approvalState = await mainModule.getApprovalState('919999999999@s.whatsapp.net');
   assert.equal(approvalState.approved, true);

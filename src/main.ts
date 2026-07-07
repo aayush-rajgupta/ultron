@@ -266,7 +266,7 @@ export function extractContactInfo(message: any): ContactInfo {
   const rawJid = message?.key?.remoteJid || '';
   const userPart = rawJid.split('@')[0] || '';
   const phoneNumber = userPart.split(':')[0] || '';
-  const pushName = message?.pushName || 'Unknown User';
+  const pushName = message?.pushName || 'Stranger';
   return { rawJid, phoneNumber, pushName };
 }
 
@@ -731,30 +731,30 @@ export async function routeMessage(message: any): Promise<void> {
           break;
         }
         case 'approve': {
-          const targetJid = normalizedChatJid;
-          if (!targetJid || !targetJid.endsWith('@s.whatsapp.net')) {
+          const targetJid = chatJid;
+          if (!targetJid || targetJid.endsWith('@g.us') || targetJid.includes('broadcast')) {
             const finalText = '❌ Please run this command in a direct message chat.';
-            await socket.sendMessage(normalizedChatJid, { text: finalText, edit: message.key });
+            await socket.sendMessage(chatJid, { text: finalText, edit: message.key });
             success = true;
             break;
           }
           await setApprovalState(targetJid, { approved: true, stopped: false });
-          const finalText = `✅ *Chat Approved*: AI Auto-Response is now ACTIVE for this chat.`;
-          await socket.sendMessage(normalizedChatJid, { text: finalText, edit: message.key });
+          const finalText = `✅ Access Granted. AI Bouncer deactivated for this chat.`;
+          await socket.sendMessage(chatJid, { text: finalText, edit: message.key });
           success = true;
           break;
         }
         case 'stop': {
-          const targetJid = normalizedChatJid;
-          if (!targetJid || !targetJid.endsWith('@s.whatsapp.net')) {
+          const targetJid = chatJid;
+          if (!targetJid || targetJid.endsWith('@g.us') || targetJid.includes('broadcast')) {
             const finalText = '❌ Please run this command in a direct message chat.';
-            await socket.sendMessage(normalizedChatJid, { text: finalText, edit: message.key });
+            await socket.sendMessage(chatJid, { text: finalText, edit: message.key });
             success = true;
             break;
           }
           await setApprovalState(targetJid, { approved: false, stopped: true });
           const finalText = `🛑 *AI Deactivated*: Auto-Response has been paused for this chat. Shifting to manual control.`;
-          await socket.sendMessage(normalizedChatJid, { text: finalText, edit: message.key });
+          await socket.sendMessage(chatJid, { text: finalText, edit: message.key });
           success = true;
           break;
         }
@@ -935,10 +935,10 @@ export async function routeMessage(message: any): Promise<void> {
       return;
     }
 
-    if (chatState.approved) {
-      // Approved: Auto AI response
+    if (!chatState.approved) {
+      // Unapproved: AI Bouncer Mode
       if (!text.trim()) return;
-      customLogger.system(`Generating auto AI response for approved chat ${contact.pushName} (${contact.phoneNumber})...`);
+      customLogger.system(`Generating AI Bouncer response for unapproved chat ${contact.pushName} (${contact.phoneNumber})...`);
       try {
         const { getChatHistory, addChatMessage } = await import('./services/memory');
         const history = await getChatHistory(contact.phoneNumber);
@@ -951,20 +951,11 @@ export async function routeMessage(message: any): Promise<void> {
 
         await socket.sendMessage(chatJid, { text: aiResponse });
       } catch (err: any) {
-        customLogger.error(`Auto AI response failed for ${contact.pushName}`, err);
+        customLogger.error(`AI Bouncer response failed for ${contact.pushName}`, err);
       }
+      return;
     } else {
-      // Unapproved: Send exactly ONE gate greeting message
-      if (!sentGateMessages.has(chatJid)) {
-        sentGateMessages.add(chatJid);
-        const greeting = getDynamicGreeting();
-        const gateText = `_${greeting}! My master is busy with some stuff. Please drop your message if it's too urgent or else wait until my master responds._`;
-        try {
-          await socket.sendMessage(chatJid, { text: gateText });
-        } catch (err) {
-          customLogger.error(`Failed to send gate message to ${contact.pushName}`, err);
-        }
-      }
+      // Approved: Do NOT trigger AI auto-responder. Let the message pass through.
     }
   }
 }
