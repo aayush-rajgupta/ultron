@@ -136,7 +136,7 @@ test('Central Logger Hook - forwards DM from unapproved user to LOG_GROUP_JID', 
   assert.match(logMessage.text, /hello logger/);
 });
 
-test('Central Logger Hook - forwards explicit group mention to LOG_GROUP_JID', async () => {
+test('Central Logger Hook - forwards DM from unapproved user with @lid JID to LOG_GROUP_JID', async () => {
   const sentMessages: { jid: string; text: string }[] = [];
   const mockSocket = {
     user: { id: "916263506758@s.whatsapp.net" },
@@ -149,26 +149,25 @@ test('Central Logger Hook - forwards explicit group mention to LOG_GROUP_JID', a
   
   process.env.LOG_GROUP_JID = "1203630248@g.us";
 
-  // Group message with mention
+  // Incoming DM from unapproved user with @lid JID
   const msg = {
-    key: { id: "msg-log-mention", remoteJid: "9112345678-1412@g.us", fromMe: false, participant: "919999999999@s.whatsapp.net" },
-    message: {
-      extendedTextMessage: {
-        text: "hey @916263506758 how is it going?",
-        contextInfo: {
-          mentionedJid: ["916263506758@s.whatsapp.net"]
-        }
-      }
-    },
+    key: { id: "msg-log-dm-lid", remoteJid: "919999999999@lid", fromMe: false },
+    message: { conversation: "hello logger via lid" },
     messageTimestamp: Math.floor((Date.now() + 10000) / 1000)
   };
   await mainModule.routeMessage(msg);
 
-  assert.equal(sentMessages.length, 1);
-  assert.equal(sentMessages[0].jid, "1203630248@g.us");
-  assert.match(sentMessages[0].text, /ULTRON LOG ENGINE/);
-  assert.match(sentMessages[0].text, /Explicit group mention/);
-  assert.match(sentMessages[0].text, /hey @916263506758 how is it going\?/);
+  assert.equal(sentMessages.length, 2);
+  const gateMessage = sentMessages.find(m => m.jid === "919999999999@lid");
+  const logMessage = sentMessages.find(m => m.jid === "1203630248@g.us");
+
+  assert.ok(gateMessage);
+  assert.match(gateMessage.text, /busy with some stuff/);
+
+  assert.ok(logMessage);
+  assert.match(logMessage.text, /ULTRON LOG ENGINE/);
+  assert.match(logMessage.text, /Incoming DM from unapproved user/);
+  assert.match(logMessage.text, /hello logger via lid/);
 });
 
 test('PluginRuntime - typewriter animation frame cap is enforced', async () => {

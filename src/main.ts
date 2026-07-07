@@ -603,7 +603,7 @@ export function ensureJidSuffix(jid: string): string {
     }
 
     // Check if JID has a standard suffix
-    if (clean.endsWith('@s.whatsapp.net') || clean.endsWith('@g.us')) {
+    if (clean.endsWith('@s.whatsapp.net') || clean.endsWith('@g.us') || clean.endsWith('@lid')) {
       // Strip any device IDs if present (e.g. 12345:1@s.whatsapp.net -> 12345@s.whatsapp.net)
       const parts = clean.split('@');
       const userPart = parts[0].split(':')[0];
@@ -854,14 +854,14 @@ export async function routeMessage(message: any): Promise<void> {
     return;
   }
 
-  // Safety boundary check verifying DM or Group JID on raw, unmodified network JID
-  const isDm = chatJid.endsWith('@s.whatsapp.net');
-  const isGroup = chatJid.endsWith('@g.us');
-
-  if (!isDm && !isGroup) {
-    customLogger.system(`[SYSTEM] -> Message skipped: Not a valid DM JID or Group JID (${chatJid})`);
+  // Safety boundary check: drop if group or broadcast
+  if (chatJid.endsWith('@g.us') || chatJid.includes('broadcast')) {
+    customLogger.system(`[SYSTEM] -> Message skipped: Group or Broadcast JID (${chatJid})`);
     return;
   }
+
+  const isDm = true;
+  const isGroup = false;
 
   const contact = extractContactInfo(message);
   customLogger.whatsapp(`Incoming from ${contact.pushName} (${contact.phoneNumber}): ${text}`);
@@ -874,13 +874,8 @@ export async function routeMessage(message: any): Promise<void> {
     return;
   }
 
-  // Mentions check in group chats
-  const botId = botJid ? botJid.split('@')[0] : '';
-  const isMentioned = isGroup && (
-    (botJid && message.message?.extendedTextMessage?.contextInfo?.mentionedJid?.includes(botJid)) ||
-    text.toLowerCase().includes('ultron') ||
-    (botId && text.includes(botId))
-  );
+  // Mentions check in group chats (always false since groups are dropped)
+  const isMentioned = false;
 
   // Central Logging Hook
   const logGroupJidStr = process.env.LOG_GROUP_JID;
@@ -900,9 +895,6 @@ export async function routeMessage(message: any): Promise<void> {
         shouldLog = true;
         logReason = "Incoming DM from unapproved user";
       }
-    } else if (isGroup && isMentioned) {
-      shouldLog = true;
-      logReason = "Explicit group mention";
     }
 
     if (shouldLog) {
@@ -928,9 +920,9 @@ export async function routeMessage(message: any): Promise<void> {
     const durationStr = formatAfkDuration(Date.now() - afkState.startTime);
     const afkResponse = `⏳ *Aayush is currently AFK* ────────────────\n📝 *Reason:* ${afkState.reason}\n⏰ *Away for:* ${durationStr}\n\n_Please leave your message. The system will alert him when he returns._`;
     try {
-      await socket.sendMessage(normalizedChatJid, { text: afkResponse });
+      await socket.sendMessage(chatJid, { text: afkResponse });
     } catch (err) {
-      customLogger.error(`Failed to send AFK reply to ${normalizedChatJid}`, err);
+      customLogger.error(`Failed to send AFK reply to ${chatJid}`, err);
     }
     return;
   }
@@ -957,18 +949,18 @@ export async function routeMessage(message: any): Promise<void> {
           addChatMessage(contact.phoneNumber, { role: 'assistant', content: aiResponse })
         ]);
 
-        await socket.sendMessage(normalizedChatJid, { text: aiResponse });
+        await socket.sendMessage(chatJid, { text: aiResponse });
       } catch (err: any) {
         customLogger.error(`Auto AI response failed for ${contact.pushName}`, err);
       }
     } else {
       // Unapproved: Send exactly ONE gate greeting message
-      if (!sentGateMessages.has(normalizedChatJid)) {
-        sentGateMessages.add(normalizedChatJid);
+      if (!sentGateMessages.has(chatJid)) {
+        sentGateMessages.add(chatJid);
         const greeting = getDynamicGreeting();
         const gateText = `_${greeting}! My master is busy with some stuff. Please drop your message if it's too urgent or else wait until my master responds._`;
         try {
-          await socket.sendMessage(normalizedChatJid, { text: gateText });
+          await socket.sendMessage(chatJid, { text: gateText });
         } catch (err) {
           customLogger.error(`Failed to send gate message to ${contact.pushName}`, err);
         }
