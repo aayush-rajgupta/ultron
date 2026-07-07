@@ -942,7 +942,8 @@ export async function routeMessage(message: any): Promise<void> {
       try {
         const { getChatHistory, addChatMessage } = await import('./services/memory');
         const history = await getChatHistory(contact.phoneNumber);
-        const { text: aiResponse } = await generateAiResponse(text, history, contact.pushName, contact.phoneNumber);
+        const isFirstContact = history.length === 0;
+        const { text: aiResponse } = await generateAiResponse(text, history, contact.pushName, contact.phoneNumber, isFirstContact);
 
         await Promise.all([
           addChatMessage(contact.phoneNumber, { role: 'user', content: text }),
