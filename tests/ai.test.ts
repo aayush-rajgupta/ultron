@@ -196,8 +196,9 @@ test('generateAiResponse - uses FIRST_CONTACT_SYSTEM_PROMPT when isFirstContact 
   
   assert.ok(capturedBody);
   const systemInstruction = capturedBody.systemInstruction?.parts?.[0]?.text || "";
-  assert.match(systemInstruction, /ULTRON/);
-  assert.match(systemInstruction, /exactly one wave emoji/);
+  assert.match(systemInstruction, /ULTRON v3.0/);
+  assert.match(systemInstruction, /Hi, this is ULTRON v3.0, Aayush Raj Gupta's AI assistant userbot\./);
+  assert.match(systemInstruction, /ABSOLUTELY ZERO EMOJIS/);
   
   await generateAiResponse("test prompt", [], "PushName", "12345", false);
   

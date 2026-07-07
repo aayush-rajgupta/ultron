@@ -289,3 +289,44 @@ test('routeMessage - !update command saves knowledge and edits the message', asy
   assert.match(updatedKnowledge, /Aayush passed Class 12 with high marks\./);
 });
 
+test('routeMessage - !urgent command triggers emergency override and cooldown', async () => {
+  const sentMessages: { jid: string; text: string }[] = [];
+  const mockSocket = {
+    user: { id: "916263506758@s.whatsapp.net" },
+    sendMessage: async (jid: string, content: any) => {
+      sentMessages.push({ jid, text: content.text });
+      return { key: { id: "mock-id" } };
+    }
+  };
+  mainModule.setSocket(mockSocket as any);
+
+  // Set user to unapproved
+  await mainModule.setApprovalState("919999999999@s.whatsapp.net", { approved: false, stopped: false });
+
+  // Mock env variables so transporter creation succeeds or fails gracefully without blocking
+  process.env.SMTP_EMAIL = "test@gmail.com";
+  process.env.SMTP_PASSWORD = "password";
+
+  // First !urgent trigger
+  const msg1 = {
+    key: { id: "msg-urgent-1", remoteJid: "919999999999@s.whatsapp.net", fromMe: false },
+    message: { conversation: "!urgent" },
+    messageTimestamp: Math.floor((Date.now() + 10000) / 1000)
+  };
+  await mainModule.routeMessage(msg1);
+
+  assert.equal(sentMessages.length, 1);
+  assert.match(sentMessages[0].text, /Emergency Override Triggered/);
+
+  // Second !urgent trigger (should trigger cooldown)
+  const msg2 = {
+    key: { id: "msg-urgent-2", remoteJid: "919999999999@s.whatsapp.net", fromMe: false },
+    message: { conversation: "!urgent" },
+    messageTimestamp: Math.floor((Date.now() + 12000) / 1000)
+  };
+  await mainModule.routeMessage(msg2);
+
+  assert.equal(sentMessages.length, 2);
+  assert.match(sentMessages[1].text, /Emergency alert already sent/);
+});
+

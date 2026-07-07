@@ -947,6 +947,29 @@ export async function routeMessage(message: any): Promise<void> {
     if (!chatState.approved) {
       // Unapproved: AI Bouncer Mode
       if (!text.trim()) return;
+
+      if (text.trim().toLowerCase() === '!urgent') {
+        try {
+          const { isEmergencyCooldownActive, setEmergencyCooldown, getChatHistory } = await import('./services/memory');
+          const cooldownActive = await isEmergencyCooldownActive(contact.phoneNumber);
+          if (cooldownActive) {
+            await socket.sendMessage(chatJid, { text: "⚠️ Emergency alert already sent. Please wait for Aayush to respond." });
+            return;
+          }
+          await setEmergencyCooldown(contact.phoneNumber);
+          const history = await getChatHistory(contact.phoneNumber);
+          const { sendEmergencyEmail } = await import('./services/email');
+          // Add trigger message to history for logging purposes
+          const currentHistory = [...history, { role: 'user' as const, content: text }];
+          await sendEmergencyEmail(contact.pushName, contact.phoneNumber, currentHistory);
+
+          await socket.sendMessage(chatJid, { text: "🚨 Emergency Override Triggered. A high-priority alert has been sent directly to Aayush's phone. He will contact you immediately." });
+        } catch (err: any) {
+          customLogger.error(`Emergency Override failed for ${contact.pushName}`, err);
+        }
+        return;
+      }
+
       customLogger.system(`Generating AI Bouncer response for unapproved chat ${contact.pushName} (${contact.phoneNumber})...`);
       try {
         const { getChatHistory, addChatMessage } = await import('./services/memory');

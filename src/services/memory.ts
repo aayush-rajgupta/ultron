@@ -64,3 +64,37 @@ export async function getMasterKnowledge(): Promise<string> {
   }
 }
 
+const COOLDOWN_KEY_PREFIX = 'ultron:emergency_cooldown:';
+const COOLDOWN_TTL_SECONDS = 1800; // 30 minutes
+const fallbackCooldowns = new Map<string, number>();
+
+export async function isEmergencyCooldownActive(phoneNumber: string): Promise<boolean> {
+  try {
+    if (!redis.isOpen) {
+      const expiration = fallbackCooldowns.get(phoneNumber);
+      if (expiration && Date.now() < expiration) {
+        return true;
+      }
+      return false;
+    }
+    const key = `${COOLDOWN_KEY_PREFIX}${phoneNumber}`;
+    const value = await redis.get(key);
+    return value !== null;
+  } catch (error) {
+    return false;
+  }
+}
+
+export async function setEmergencyCooldown(phoneNumber: string): Promise<void> {
+  try {
+    if (!redis.isOpen) {
+      fallbackCooldowns.set(phoneNumber, Date.now() + COOLDOWN_TTL_SECONDS * 1000);
+      return;
+    }
+    const key = `${COOLDOWN_KEY_PREFIX}${phoneNumber}`;
+    await redis.setEx(key, COOLDOWN_TTL_SECONDS, 'active');
+  } catch (error) {
+    // Fail silently
+  }
+}
+
