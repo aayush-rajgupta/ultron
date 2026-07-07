@@ -769,7 +769,16 @@ export async function routeMessage(message: any): Promise<void> {
           break;
         }
         case 'update': {
-          const finalText = 'Update check not yet implemented — coming in a later phase.';
+          const match = text.match(/^!update\s+(.+)$/i);
+          if (!match) {
+            await socket.sendMessage(normalizedChatJid, { text: '❌ Usage: !update <text>', edit: message.key });
+            success = true;
+            break;
+          }
+          const infoText = match[1].trim();
+          const { updateMasterKnowledge } = await import('./services/memory');
+          await updateMasterKnowledge(infoText);
+          const finalText = '✅ Master Knowledge updated.';
           await socket.sendMessage(normalizedChatJid, { text: finalText, edit: message.key });
           success = true;
           break;

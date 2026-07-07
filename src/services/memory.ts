@@ -36,3 +36,31 @@ export async function addChatMessage(phoneNumber: string, message: ChatMessage):
     // Fail silently
   }
 }
+
+let fallbackMasterKnowledge = '';
+
+export async function updateMasterKnowledge(text: string): Promise<void> {
+  try {
+    if (!redis.isOpen) {
+      fallbackMasterKnowledge = fallbackMasterKnowledge ? `${fallbackMasterKnowledge}\n${text}` : text;
+      return;
+    }
+    const current = await redis.get('ultron:master_knowledge');
+    const updated = current ? `${current}\n${text}` : text;
+    await redis.set('ultron:master_knowledge', updated);
+  } catch (error) {
+    // Fail silently
+  }
+}
+
+export async function getMasterKnowledge(): Promise<string> {
+  try {
+    if (!redis.isOpen) {
+      return fallbackMasterKnowledge;
+    }
+    return (await redis.get('ultron:master_knowledge')) || fallbackMasterKnowledge;
+  } catch (error) {
+    return fallbackMasterKnowledge;
+  }
+}
+

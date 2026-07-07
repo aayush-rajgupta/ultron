@@ -260,3 +260,32 @@ test('extractContactInfo - extracts metadata correctly', () => {
   assert.equal(info.phoneNumber, "919999999999");
   assert.equal(info.pushName, "Alice");
 });
+
+test('routeMessage - !update command saves knowledge and edits the message', async () => {
+  const sentMessages: { jid: string; text: string; editKey?: any }[] = [];
+  const mockSocket = {
+    user: { id: "916263506758@s.whatsapp.net" },
+    sendMessage: async (jid: string, content: any) => {
+      sentMessages.push({ jid, text: content.text, editKey: content.edit });
+      return { key: { id: "mock-id" } };
+    }
+  };
+  mainModule.setSocket(mockSocket as any);
+
+  const { getMasterKnowledge } = await import('../src/services/memory');
+
+  const msg = {
+    key: { id: "msg-update-command", remoteJid: "916263506758@s.whatsapp.net", fromMe: true },
+    message: { conversation: "!update Aayush passed Class 12 with high marks." },
+    messageTimestamp: Math.floor((Date.now() + 10000) / 1000)
+  };
+  await mainModule.routeMessage(msg);
+
+  assert.equal(sentMessages.length, 1);
+  assert.equal(sentMessages[0].text, "✅ Master Knowledge updated.");
+  assert.deepEqual(sentMessages[0].editKey, msg.key);
+
+  const updatedKnowledge = await getMasterKnowledge();
+  assert.match(updatedKnowledge, /Aayush passed Class 12 with high marks\./);
+});
+

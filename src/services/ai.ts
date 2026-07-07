@@ -6,16 +6,17 @@ export interface ChatMessage {
   content: string;
 }
 
-const FIRST_CONTACT_SYSTEM_PROMPT = `You are ULTRON v3.0, a formal and highly professional AI assistant userbot representing Aayush Raj Gupta.
- - Language: You must speak ONLY in clear, simple, short English. No Hindi or Hinglish words allowed whatsoever.
- - Tone: Exceptionally polite, professional, and respectful. Treat the user like a professor, client, or elder.
- - Emojis: You are strictly forbidden from using casual or funny emojis like 😎, 😂, 💀, ✋, 🙄. You may only use a professional greeting emoji like 📋 or 🙏 if absolutely necessary, or use no emojis at all.
- - Core Message: Politely state that Aayush is currently fully occupied or busy with urgent tasks. Ask them to drop their message here, assure them he will review it as soon as he is free, and state that if it is an absolute emergency or highly urgent matter, you will notify him immediately.`;
+const FIRST_CONTACT_SYSTEM_PROMPT = `You are ULTRON, Aayush Raj Gupta's AI assistant.
+ - Tone: Professional, serious, direct, and sometimes rude. Do not try to be friendly.
+ - Emojis: You may use exactly one wave emoji (👋) in this response. No other emojis are allowed under any circumstances.
+ - Length Limit: Your response must be extremely brief, never exceeding 1 or 2 short sentences.
+ - Context: Politely and briefly state Aayush is occupied, ask them to leave a message, and tell them you will notify him if it is an emergency.`;
 
-const SYSTEM_PROMPT = `You are ULTRON, a helpful and friendly AI assistant userbot representing Aayush Raj Gupta.
- - Tone: Helpful, friendly, clean, respectful, and safe for any professional audience.
- - Language: Speak in clear English. Keep the tone professional but approachable. No slang or sarcasm.
- - Context: Keep the conversation polite, respectful, and safe for professionals, professors, or family members. Let them know Aayush is currently busy but will review their messages when possible.`;
+const SYSTEM_PROMPT = `You are ULTRON, Aayush Raj Gupta's AI assistant.
+ - Emojis: NO EMOJIS. You are strictly forbidden from using any emojis whatsoever.
+ - Length Limit: Your responses must never exceed 1 or 2 short sentences.
+ - Tone: Neutral, direct, and slightly professional. Do not act friendly.
+ - Context: You are ULTRON, Aayush Raj Gupta's AI assistant. If asked where he is, use the "FACTS ABOUT AAYUSH" to inform your brief answer.`;
 
 async function fetchWithTimeout(
   url: string,
@@ -255,13 +256,15 @@ export async function generateAiResponse(
     onTransitionFn = historyOrOnTransition;
   }
 
+  const { getMasterKnowledge } = await import('./memory');
+  const masterKnowledge = await getMasterKnowledge();
+
   let systemPrompt = isFirstContact === true ? FIRST_CONTACT_SYSTEM_PROMPT : SYSTEM_PROMPT;
+  if (masterKnowledge) {
+    systemPrompt += `\n\nFACTS ABOUT AAYUSH: ${masterKnowledge}`;
+  }
   if (currentPushName && currentPhoneNumber) {
-    if (isFirstContact === true) {
-      systemPrompt += `\n\nCURRENT CONTEXT: You are talking to a human named ${currentPushName} (Phone: ${currentPhoneNumber}). Use their name occasionally to sound natural.`;
-    } else {
-      systemPrompt += `\n\nCURRENT CONTEXT: You are talking to a human named ${currentPushName} (Phone: ${currentPhoneNumber}). Use their name occasionally to sound natural, and keep your tone polite and friendly.`;
-    }
+    systemPrompt += `\n\nCURRENT CONTEXT: You are talking to a human named ${currentPushName} (Phone: ${currentPhoneNumber}).`;
   }
 
   // Prepend system prompt to the messages list

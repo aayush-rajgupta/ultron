@@ -196,13 +196,49 @@ test('generateAiResponse - uses FIRST_CONTACT_SYSTEM_PROMPT when isFirstContact 
   
   assert.ok(capturedBody);
   const systemInstruction = capturedBody.systemInstruction?.parts?.[0]?.text || "";
-  assert.match(systemInstruction, /ULTRON v3.0/);
-  assert.match(systemInstruction, /speak ONLY in clear, simple, short English/);
+  assert.match(systemInstruction, /ULTRON/);
+  assert.match(systemInstruction, /exactly one wave emoji/);
   
   await generateAiResponse("test prompt", [], "PushName", "12345", false);
   
   const systemInstruction2 = capturedBody.systemInstruction?.parts?.[0]?.text || "";
-  assert.doesNotMatch(systemInstruction2, /ULTRON v3.0/);
-  assert.match(systemInstruction2, /helpful and friendly/);
+  assert.match(systemInstruction2, /NO EMOJIS/);
 });
+
+test('generateAiResponse - retrieves and injects master knowledge into system prompt', async () => {
+  process.env.AI_PROVIDER_PRIORITY = "Gemini";
+  process.env.GEMINI_API_KEY = "mock-gemini-key";
+
+  const { updateMasterKnowledge } = await import('../src/services/memory');
+  const { redis } = await import('../src/main');
+  
+  if (redis.isOpen) {
+    await redis.del('ultron:master_knowledge');
+  }
+
+  await updateMasterKnowledge("Aayush is a KIIT student.");
+
+  let capturedBody: any = null;
+  globalThis.fetch = async (url, options) => {
+    const bodyStr = options?.body as string;
+    capturedBody = JSON.parse(bodyStr);
+    return {
+      ok: true,
+      json: async () => ({
+        candidates: [{ content: { parts: [{ text: "Hello!" }] } }]
+      })
+    } as any;
+  };
+
+  await generateAiResponse("test prompt", [], "PushName", "12345", false);
+  
+  assert.ok(capturedBody);
+  const systemInstruction = capturedBody.systemInstruction?.parts?.[0]?.text || "";
+  assert.match(systemInstruction, /FACTS ABOUT AAYUSH: Aayush is a KIIT student\./);
+
+  if (redis.isOpen) {
+    await redis.del('ultron:master_knowledge');
+  }
+});
+
 
