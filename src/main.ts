@@ -50,7 +50,7 @@ const categoryColors: Record<string, string> = {
   ERROR: colors.red,
 };
 
-const customLogger = {
+export const customLogger = {
   log(category: 'SYSTEM' | 'WHATSAPP' | 'COMMAND' | 'WARNING' | 'ERROR', message: string, ...args: any[]) {
     const timeStr = `${colors.gray}[${formatTime()}]${colors.reset}`;
     const catColor = categoryColors[category] || colors.reset;
@@ -185,8 +185,8 @@ process.on('unhandledRejection', (reason: any) => {
 });
 
 const redisUrl = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379';
-const prisma = new PrismaClient({ datasources: { db: { url: process.env.DATABASE_URL ?? 'postgresql://postgres:postgres@localhost:5432/ultron' } } });
-const redis = createClient({
+export const prisma = new PrismaClient({ datasources: { db: { url: process.env.DATABASE_URL ?? 'postgresql://postgres:postgres@localhost:5432/ultron' } } });
+export const redis = createClient({
   url: redisUrl,
   socket: {
     reconnectStrategy: false,
@@ -918,7 +918,15 @@ export async function routeMessage(message: any): Promise<void> {
       if (!text.trim()) return;
       customLogger.system(`Generating auto AI response for approved chat ${cleanSender}...`);
       try {
-        const { text: aiResponse } = await generateAiResponse(text);
+        const { getChatHistory, addChatMessage } = await import('./services/memory');
+        const history = await getChatHistory(normalizedChatJid);
+        const { text: aiResponse } = await generateAiResponse(text, history);
+
+        await Promise.all([
+          addChatMessage(normalizedChatJid, { role: 'user', content: text }),
+          addChatMessage(normalizedChatJid, { role: 'assistant', content: aiResponse })
+        ]);
+
         await socket.sendMessage(normalizedChatJid, { text: aiResponse });
       } catch (err: any) {
         customLogger.error(`Auto AI response failed for ${cleanSender}`, err);
