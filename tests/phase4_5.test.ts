@@ -216,3 +216,24 @@ test('Central Logger Hook - media payload safety', async () => {
   assert.ok(logMessage);
   assert.match(logMessage.text, /\[Media or Empty Message\]/);
 });
+
+test('ensureJidSuffix - verification and idempotency', () => {
+  const ensureJidSuffix = mainModule.ensureJidSuffix;
+  assert.equal(ensureJidSuffix("919999999999"), "919999999999@s.whatsapp.net");
+  assert.equal(ensureJidSuffix("919999999999@s.whatsapp.net"), "919999999999@s.whatsapp.net");
+  assert.equal(ensureJidSuffix("919999999999:1@s.whatsapp.net"), "919999999999@s.whatsapp.net");
+  assert.equal(ensureJidSuffix("919999999999@c.us"), "919999999999@s.whatsapp.net");
+  assert.equal(ensureJidSuffix("1203630248@g.us"), "1203630248@g.us");
+});
+
+test('extractContactInfo - extracts metadata correctly', () => {
+  const extractContactInfo = mainModule.extractContactInfo;
+  const msg = {
+    key: { remoteJid: "919999999999:2@s.whatsapp.net" },
+    pushName: "Alice"
+  };
+  const info = extractContactInfo(msg);
+  assert.equal(info.rawJid, "919999999999:2@s.whatsapp.net");
+  assert.equal(info.phoneNumber, "919999999999");
+  assert.equal(info.pushName, "Alice");
+});

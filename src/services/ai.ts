@@ -29,8 +29,9 @@ async function fetchWithTimeout(
 
 async function callGemini(messages: ChatMessage[]): Promise<string> {
   const apiKey = process.env.GEMINI_API_KEY;
+  const systemMsg = messages.find(m => m.role === 'system')?.content || SYSTEM_PROMPT;
   const systemInstructionPart = {
-    parts: [{ text: SYSTEM_PROMPT }]
+    parts: [{ text: systemMsg }]
   };
   const contents = messages
     .filter(msg => msg.role !== 'system')
@@ -83,6 +84,7 @@ async function callOpenAI(messages: ChatMessage[]): Promise<string> {
 
 async function callClaude(messages: ChatMessage[]): Promise<string> {
   const apiKey = process.env.ANTHROPIC_API_KEY || '';
+  const systemMsg = messages.find(m => m.role === 'system')?.content || SYSTEM_PROMPT;
   const filteredMessages = messages
     .filter(msg => msg.role !== 'system')
     .map(msg => ({
@@ -100,7 +102,7 @@ async function callClaude(messages: ChatMessage[]): Promise<string> {
     body: JSON.stringify({
       model: 'claude-3-5-sonnet-latest',
       max_tokens: 4096,
-      system: SYSTEM_PROMPT,
+      system: systemMsg,
       messages: filteredMessages
     })
   });
@@ -228,20 +230,34 @@ async function callCohere(messages: ChatMessage[]): Promise<string> {
 export async function generateAiResponse(
   prompt: string,
   historyOrOnTransition?: any,
-  onTransition?: (status: string) => Promise<void>
+  onTransitionOrPushName?: any,
+  phoneNumber?: string
 ): Promise<{ text: string; providerUsed: string }> {
   let history: ChatMessage[] = [];
-  let onTransitionFn = onTransition;
+  let onTransitionFn: ((status: string) => Promise<void>) | undefined = undefined;
+  let currentPushName = '';
+  let currentPhoneNumber = '';
 
   if (Array.isArray(historyOrOnTransition)) {
     history = historyOrOnTransition;
+    if (typeof onTransitionOrPushName === 'string') {
+      currentPushName = onTransitionOrPushName;
+      currentPhoneNumber = phoneNumber || '';
+    } else if (typeof onTransitionOrPushName === 'function') {
+      onTransitionFn = onTransitionOrPushName;
+    }
   } else if (typeof historyOrOnTransition === 'function') {
     onTransitionFn = historyOrOnTransition;
   }
 
+  let systemPrompt = SYSTEM_PROMPT;
+  if (currentPushName && currentPhoneNumber) {
+    systemPrompt += `\n\nCURRENT CHAT CONTEXT: You are currently talking to a user named '${currentPushName}' (Phone: +${currentPhoneNumber}). Use their name occasionally to make the conversation feel personal, but keep your snarky, bouncer attitude.`;
+  }
+
   // Prepend system prompt to the messages list
   const fullMessages: ChatMessage[] = [
-    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: systemPrompt },
     ...history,
     { role: 'user', content: prompt }
   ];

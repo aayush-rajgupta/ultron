@@ -250,6 +250,26 @@ function printStatusTable(dbStatus: string, redisStatus: string, jid: string): v
   originalLog(`└──────────────────────┴─────────────────────────────────┘`);
 }
 
+export function getPhoneFromJid(jid: string): string {
+  const clean = jid.trim();
+  const userPart = clean.split('@')[0] || '';
+  return userPart.split(':')[0] || clean;
+}
+
+export interface ContactInfo {
+  rawJid: string;
+  phoneNumber: string;
+  pushName: string;
+}
+
+export function extractContactInfo(message: any): ContactInfo {
+  const rawJid = message?.key?.remoteJid || '';
+  const userPart = rawJid.split('@')[0] || '';
+  const phoneNumber = userPart.split(':')[0] || '';
+  const pushName = message?.pushName || 'Unknown User';
+  return { rawJid, phoneNumber, pushName };
+}
+
 export const fallbackChatState = new Map<string, { approved: boolean; stopped: boolean }>();
 export const sentGateMessages = new Set<string>();
 
@@ -259,34 +279,36 @@ export let memoryAfkState = {
   startTime: 0
 };
 
-export async function getApprovalState(jid: string): Promise<{ approved: boolean; stopped: boolean }> {
+export async function getApprovalState(jidOrPhone: string): Promise<{ approved: boolean; stopped: boolean }> {
+  const phoneNumber = getPhoneFromJid(jidOrPhone);
   if (prismaConnected) {
     try {
-      const record = await prisma.chatApproval.findUnique({ where: { jid } });
+      const record = await prisma.chatApproval.findUnique({ where: { jid: phoneNumber } });
       if (record) {
         return { approved: record.approved, stopped: record.stopped };
       }
     } catch (err) {
-      customLogger.error(`Error reading chat state for ${jid} from db`, err);
+      customLogger.error(`Error reading chat state for phone ${phoneNumber} from db`, err);
     }
   }
-  return fallbackChatState.get(jid) || { approved: false, stopped: false };
+  return fallbackChatState.get(phoneNumber) || { approved: false, stopped: false };
 }
 
-export async function setApprovalState(jid: string, state: { approved: boolean; stopped: boolean }): Promise<void> {
+export async function setApprovalState(jidOrPhone: string, state: { approved: boolean; stopped: boolean }): Promise<void> {
+  const phoneNumber = getPhoneFromJid(jidOrPhone);
   if (prismaConnected) {
     try {
       await prisma.chatApproval.upsert({
-        where: { jid },
+        where: { jid: phoneNumber },
         update: { approved: state.approved, stopped: state.stopped },
-        create: { jid, approved: state.approved, stopped: state.stopped }
+        create: { jid: phoneNumber, approved: state.approved, stopped: state.stopped }
       });
       return;
     } catch (err) {
-      customLogger.error(`Error writing chat state for ${jid} to db`, err);
+      customLogger.error(`Error writing chat state for phone ${phoneNumber} to db`, err);
     }
   }
-  fallbackChatState.set(jid, state);
+  fallbackChatState.set(phoneNumber, state);
 }
 
 export function getDynamicGreeting(): string {
@@ -609,7 +631,10 @@ export async function routeMessage(message: any): Promise<void> {
   const ownerJid = process.env.OWNER_JID ? ensureJidSuffix(process.env.OWNER_JID) : botJid;
 
   const chatJid = message?.key?.remoteJid;
-  if (!chatJid) return;
+  if (!chatJid) {
+    customLogger.system(`[SYSTEM] -> Message skipped: Missing remoteJid`);
+    return;
+  }
   const normalizedChatJid = ensureJidSuffix(chatJid);
 
   if (isOwnerCommand) {
@@ -829,8 +854,17 @@ export async function routeMessage(message: any): Promise<void> {
     return;
   }
 
-  const cleanSender = normalizedChatJid.split('@')[0];
-  customLogger.whatsapp(`Incoming from ${cleanSender}: ${text}`);
+  // Safety boundary check verifying DM or Group JID on raw, unmodified network JID
+  const isDm = chatJid.endsWith('@s.whatsapp.net');
+  const isGroup = chatJid.endsWith('@g.us');
+
+  if (!isDm && !isGroup) {
+    customLogger.system(`[SYSTEM] -> Message skipped: Not a valid DM JID or Group JID (${chatJid})`);
+    return;
+  }
+
+  const contact = extractContactInfo(message);
+  customLogger.whatsapp(`Incoming from ${contact.pushName} (${contact.phoneNumber}): ${text}`);
 
   const senderJid = message?.key?.participant || chatJid;
   const normalizedSenderJid = ensureJidSuffix(senderJid);
@@ -839,9 +873,6 @@ export async function routeMessage(message: any): Promise<void> {
   if (isOwner) {
     return;
   }
-
-  const isDm = normalizedChatJid.endsWith('@s.whatsapp.net');
-  const isGroup = normalizedChatJid.endsWith('@g.us');
 
   // Mentions check in group chats
   const botId = botJid ? botJid.split('@')[0] : '';
@@ -864,7 +895,7 @@ export async function routeMessage(message: any): Promise<void> {
     let logReason = "";
 
     if (isDm) {
-      const chatState = await getApprovalState(normalizedChatJid);
+      const chatState = await getApprovalState(contact.phoneNumber);
       if (!chatState.approved && !chatState.stopped) {
         shouldLog = true;
         logReason = "Incoming DM from unapproved user";
@@ -875,12 +906,11 @@ export async function routeMessage(message: any): Promise<void> {
     }
 
     if (shouldLog) {
-      const pushName = message.pushName || "Unknown";
       const logText = (text || '').trim() || "[Media or Empty Message]";
       const logMessage = [
         `🔔 *ULTRON LOG ENGINE* ────────────────`,
         `🚨 *Reason:* ${logReason}`,
-        `👤 *User:* ${pushName} (${cleanSender})`,
+        `👤 *User:* ${contact.pushName} (${contact.phoneNumber})`,
         `💬 *Message:* ${logText}`,
       ].join('\n');
 
@@ -907,7 +937,7 @@ export async function routeMessage(message: any): Promise<void> {
 
   // 2. DM Gating logic
   if (isDm) {
-    const chatState = await getApprovalState(normalizedChatJid);
+    const chatState = await getApprovalState(contact.phoneNumber);
     if (chatState.stopped) {
       // Manual control deactivates AI/Gate responses
       return;
@@ -916,20 +946,20 @@ export async function routeMessage(message: any): Promise<void> {
     if (chatState.approved) {
       // Approved: Auto AI response
       if (!text.trim()) return;
-      customLogger.system(`Generating auto AI response for approved chat ${cleanSender}...`);
+      customLogger.system(`Generating auto AI response for approved chat ${contact.pushName} (${contact.phoneNumber})...`);
       try {
         const { getChatHistory, addChatMessage } = await import('./services/memory');
-        const history = await getChatHistory(normalizedChatJid);
-        const { text: aiResponse } = await generateAiResponse(text, history);
+        const history = await getChatHistory(contact.phoneNumber);
+        const { text: aiResponse } = await generateAiResponse(text, history, contact.pushName, contact.phoneNumber);
 
         await Promise.all([
-          addChatMessage(normalizedChatJid, { role: 'user', content: text }),
-          addChatMessage(normalizedChatJid, { role: 'assistant', content: aiResponse })
+          addChatMessage(contact.phoneNumber, { role: 'user', content: text }),
+          addChatMessage(contact.phoneNumber, { role: 'assistant', content: aiResponse })
         ]);
 
         await socket.sendMessage(normalizedChatJid, { text: aiResponse });
       } catch (err: any) {
-        customLogger.error(`Auto AI response failed for ${cleanSender}`, err);
+        customLogger.error(`Auto AI response failed for ${contact.pushName}`, err);
       }
     } else {
       // Unapproved: Send exactly ONE gate greeting message
@@ -940,7 +970,7 @@ export async function routeMessage(message: any): Promise<void> {
         try {
           await socket.sendMessage(normalizedChatJid, { text: gateText });
         } catch (err) {
-          customLogger.error(`Failed to send gate message to ${cleanSender}`, err);
+          customLogger.error(`Failed to send gate message to ${contact.pushName}`, err);
         }
       }
     }
