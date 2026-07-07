@@ -406,10 +406,24 @@ function extractText(message: any): string {
   ).trim();
 }
 
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
+  let timeoutId: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<T>((resolve) => {
+    timeoutId = setTimeout(() => resolve(fallback), timeoutMs);
+  });
+  return Promise.race([
+    promise.then((val) => {
+      if (timeoutId) clearTimeout(timeoutId);
+      return val;
+    }),
+    timeoutPromise,
+  ]);
+}
+
 export async function getPrismaStatus(): Promise<string> {
   try {
-    await prisma.$queryRaw`SELECT 1`;
-    return 'connected';
+    const query = prisma.$queryRaw`SELECT 1`.then(() => 'connected');
+    return await withTimeout(query, 2000, 'timeout');
   } catch {
     return 'disconnected';
   }
@@ -417,8 +431,8 @@ export async function getPrismaStatus(): Promise<string> {
 
 export async function getRedisStatus(): Promise<string> {
   try {
-    await redis.ping();
-    return 'connected';
+    const ping = redis.ping().then(() => 'connected');
+    return await withTimeout(ping, 2000, 'timeout');
   } catch {
     return 'disconnected';
   }
@@ -555,16 +569,34 @@ async function createPrismaAuthState(): Promise<any> {
   };
 }
 
+export function ensureJidSuffix(jid: string): string {
+  try {
+    if (!jid || typeof jid !== 'string') return '';
+    const clean = jid.trim();
+    if (!clean) return '';
+    if (clean.includes('@')) return jidNormalizedUser(clean);
+    return `${clean}@s.whatsapp.net`;
+  } catch (err) {
+    customLogger.warn(`Invalid JID format: "${jid}"`);
+    return '';
+  }
+}
+
 export async function routeMessage(message: any): Promise<void> {
   if (!socket) return;
   const text = extractText(message);
   const fromMe = message?.key?.fromMe === true;
   const isOwnerCommand = fromMe && text.trim().startsWith('!');
 
+  const botJid = socket.user?.id ? jidNormalizedUser(socket.user.id) : '';
+  const ownerJid = process.env.OWNER_JID ? ensureJidSuffix(process.env.OWNER_JID) : botJid;
+
+  const chatJid = message?.key?.remoteJid;
+  if (!chatJid) return;
+  const normalizedChatJid = ensureJidSuffix(chatJid);
+
   if (isOwnerCommand) {
     const command = text.trim().slice(1).split(/\s+/)[0]?.toLowerCase() ?? '';
-    const chatJid = message?.key?.remoteJid;
-    if (!chatJid) return;
 
     // Deactivate AFK in background asynchronously to not block execution
     const isAfkCommand = command === 'afk';
@@ -578,16 +610,13 @@ export async function routeMessage(message: any): Promise<void> {
     }
 
     const startedAt = Date.now();
-    const editKey = message?.key;
     let success = false;
     try {
       switch (command) {
         case 'ping': {
           const latencyMs = Date.now() - startedAt;
           const finalText = `*Pong!* ${latencyMs}ms`;
-          if (editKey) {
-            await socket.sendMessage(chatJid, { text: finalText, edit: editKey });
-          }
+          await socket.sendMessage(normalizedChatJid, { text: finalText });
           success = true;
           break;
         }
@@ -605,7 +634,7 @@ export async function routeMessage(message: any): Promise<void> {
 
           const afkStr = afkState.isAfk ? `Active (Reason: ${afkState.reason})` : `Inactive`;
 
-          const runtime = new PluginRuntime(process.env.OWNER_JID || 'owner');
+          const runtime = new PluginRuntime(ownerJid);
           const pluginCount = runtime.getPluginList().length;
           const priorityStr = process.env.AI_PROVIDER_PRIORITY || "Gemini,OpenAI,Claude,OpenRouter,DeepSeek,Groq,Mistral,Cohere";
           const aiProvider = priorityStr.split(',')[0]?.trim() || 'Gemini';
@@ -620,17 +649,13 @@ export async function routeMessage(message: any): Promise<void> {
             `🛠 Plugins: ${pluginCount}`,
             `🧠 AI Provider: ${aiProvider}`
           ].join('\n');
-          if (editKey && socket) {
-            await socket.sendMessage(chatJid, { text: finalText, edit: editKey });
-          }
+          await socket.sendMessage(normalizedChatJid, { text: finalText });
           success = true;
           break;
         }
         case 'uptime': {
           const finalText = `*Uptime*\n${formatUptime(process.uptime())}`;
-          if (editKey) {
-            await socket.sendMessage(chatJid, { text: finalText, edit: editKey });
-          }
+          await socket.sendMessage(normalizedChatJid, { text: finalText });
           success = true;
           break;
         }
@@ -645,9 +670,7 @@ export async function routeMessage(message: any): Promise<void> {
             `⚡ Cache: ${redisStatus}`,
             `📩 Messages received: ${messagesReceived}`,
           ].join('\n');
-          if (editKey) {
-            await socket.sendMessage(chatJid, { text: finalText, edit: editKey });
-          }
+          await socket.sendMessage(normalizedChatJid, { text: finalText });
           success = true;
           break;
         }
@@ -661,45 +684,35 @@ export async function routeMessage(message: any): Promise<void> {
             '- !help — this list',
             '- !update — check for updates (not yet implemented)',
           ].join('\n');
-          if (editKey) {
-            await socket.sendMessage(chatJid, { text: finalText, edit: editKey });
-          }
+          await socket.sendMessage(normalizedChatJid, { text: finalText });
           success = true;
           break;
         }
         case 'approve': {
-          const targetJid = chatJid;
+          const targetJid = normalizedChatJid;
           if (!targetJid || !targetJid.endsWith('@s.whatsapp.net')) {
             const finalText = '❌ Please run this command in a direct message chat.';
-            if (editKey && socket) {
-              await socket.sendMessage(chatJid, { text: finalText, edit: editKey });
-            }
+            await socket.sendMessage(normalizedChatJid, { text: finalText });
             success = true;
             break;
           }
           await setApprovalState(targetJid, { approved: true, stopped: false });
           const finalText = `✅ *Chat Approved*: AI Auto-Response is now ACTIVE for this chat.`;
-          if (editKey && socket) {
-            await socket.sendMessage(chatJid, { text: finalText, edit: editKey });
-          }
+          await socket.sendMessage(normalizedChatJid, { text: finalText });
           success = true;
           break;
         }
         case 'stop': {
-          const targetJid = chatJid;
+          const targetJid = normalizedChatJid;
           if (!targetJid || !targetJid.endsWith('@s.whatsapp.net')) {
             const finalText = '❌ Please run this command in a direct message chat.';
-            if (editKey && socket) {
-              await socket.sendMessage(chatJid, { text: finalText, edit: editKey });
-            }
+            await socket.sendMessage(normalizedChatJid, { text: finalText });
             success = true;
             break;
           }
           await setApprovalState(targetJid, { approved: false, stopped: true });
           const finalText = `🛑 *AI Deactivated*: Auto-Response has been paused for this chat. Shifting to manual control.`;
-          if (editKey && socket) {
-            await socket.sendMessage(chatJid, { text: finalText, edit: editKey });
-          }
+          await socket.sendMessage(normalizedChatJid, { text: finalText });
           success = true;
           break;
         }
@@ -709,55 +722,64 @@ export async function routeMessage(message: any): Promise<void> {
           await setAfkState(true, reason, Date.now());
           customLogger.system(`AFK Mode activated: ${reason}`);
           const finalText = `💤 *ULTRON OS: AFK Mode Activated* \nReason: ${reason}`;
-          if (editKey && socket) {
-            await socket.sendMessage(chatJid, { text: finalText, edit: editKey });
-          }
+          await socket.sendMessage(normalizedChatJid, { text: finalText });
           success = true;
           break;
         }
         case 'update': {
           const finalText = 'Update check not yet implemented — coming in a later phase.';
-          if (editKey) {
-            await socket.sendMessage(chatJid, { text: finalText, edit: editKey });
-          }
+          await socket.sendMessage(normalizedChatJid, { text: finalText });
           success = true;
           break;
         }
         default: {
-          const runtime = new PluginRuntime(process.env.OWNER_JID || 'owner');
+          const runtime = new PluginRuntime(ownerJid);
           const args = text.trim().slice(1).split(/\s+/).slice(1);
+          let activeMsgKey: any = null;
           try {
-            const responseText = await runtime.dispatch(command, {
-              sender: message.key.fromMe ? (process.env.OWNER_JID || 'owner') : (message.key.participant || chatJid),
-              owner: process.env.OWNER_JID || 'owner',
-              args,
-              chatJid,
-              editMessage: async (newText: string) => {
-                if (editKey && socket) {
-                  await socket.sendMessage(chatJid, { text: newText, edit: editKey });
-                }
+            const editMessage = async (newText: string) => {
+              if (!socket) return;
+              if (!activeMsgKey) {
+                const sent = await socket.sendMessage(normalizedChatJid, { text: newText });
+                activeMsgKey = sent?.key;
+              } else {
+                await socket.sendMessage(normalizedChatJid, { text: newText, edit: activeMsgKey });
               }
+            };
+
+            const responseText = await runtime.dispatch(command, {
+              sender: message.key.fromMe ? ownerJid : ensureJidSuffix(message.key.participant || chatJid),
+              owner: ownerJid,
+              args,
+              chatJid: normalizedChatJid,
+              editMessage,
             } as any);
 
             if (responseText && responseText !== "Owner-only command." && !responseText.startsWith("Unknown command:")) {
-              if (editKey && socket) {
-                await socket.sendMessage(chatJid, { text: responseText, edit: editKey });
+              if (activeMsgKey) {
+                await socket.sendMessage(normalizedChatJid, { text: responseText, edit: activeMsgKey });
+              } else {
+                await socket.sendMessage(normalizedChatJid, { text: responseText });
               }
               success = true;
             } else if (responseText === "Owner-only command.") {
-              if (editKey && socket) {
-                await socket.sendMessage(chatJid, { text: "❌ Owner-only command.", edit: editKey });
+              if (activeMsgKey) {
+                await socket.sendMessage(normalizedChatJid, { text: "❌ Owner-only command.", edit: activeMsgKey });
+              } else {
+                await socket.sendMessage(normalizedChatJid, { text: "❌ Owner-only command." });
               }
               success = true;
             } else {
-              if (editKey && socket) {
-                await socket.sendMessage(chatJid, { text: `❌ Unknown command: !${command}`, edit: editKey });
+              if (!activeMsgKey) {
+                await socket.sendMessage(normalizedChatJid, { text: `❌ Unknown command: !${command}` });
               }
             }
           } catch (err: any) {
             customLogger.error(`Plugin execution failed for !${command}`, err);
-            if (editKey && socket) {
-              await socket.sendMessage(chatJid, { text: `❌ Error: ${err.message || err}`, edit: editKey });
+            if (activeMsgKey) {
+              await socket.sendMessage(normalizedChatJid, { text: `❌ Error: ${err.message || err}`, edit: activeMsgKey });
+            } else {
+              await socket.sendMessage(normalizedChatJid, { text: `❌ Error: ${err.message || err}` });
             }
           }
           break;
@@ -766,12 +788,12 @@ export async function routeMessage(message: any): Promise<void> {
 
       if (success) {
         const duration = Date.now() - startedAt;
-        const senderName = message.pushName ?? message.key.participant?.split('@')[0] ?? chatJid.split('@')[0] ?? 'Me';
+        const senderName = message.pushName ?? message.key.participant?.split('@')[0] ?? normalizedChatJid.split('@')[0] ?? 'Me';
         customLogger.command(`!${command} from ${senderName} (${duration}ms)`);
       }
     } catch (error) {
       const duration = Date.now() - startedAt;
-      const senderName = message.pushName ?? message.key.participant?.split('@')[0] ?? chatJid.split('@')[0] ?? 'Me';
+      const senderName = message.pushName ?? message.key.participant?.split('@')[0] ?? normalizedChatJid.split('@')[0] ?? 'Me';
       customLogger.error(`Command !${command} from ${senderName} failed after ${duration}ms`, error);
     }
     return;
@@ -803,20 +825,19 @@ export async function routeMessage(message: any): Promise<void> {
     return;
   }
 
-  const sender = message?.key?.remoteJid ?? 'unknown';
-  const cleanSender = sender.split('@')[0];
+  const cleanSender = normalizedChatJid.split('@')[0];
   customLogger.whatsapp(`Incoming from ${cleanSender}: ${text}`);
 
-  const senderJid = message?.key?.participant || sender;
-  const isOwner = fromMe || senderJid === (process.env.OWNER_JID || 'owner');
+  const senderJid = message?.key?.participant || chatJid;
+  const normalizedSenderJid = ensureJidSuffix(senderJid);
+  const isOwner = fromMe || normalizedSenderJid === ownerJid;
 
   if (isOwner) {
     return;
   }
 
-  const isDm = sender.endsWith('@s.whatsapp.net');
-  const isGroup = sender.endsWith('@g.us');
-  const botJid = socket?.user?.id ? jidNormalizedUser(socket.user.id) : '';
+  const isDm = normalizedChatJid.endsWith('@s.whatsapp.net');
+  const isGroup = normalizedChatJid.endsWith('@g.us');
 
   // Mentions check in group chats
   const botId = botJid ? botJid.split('@')[0] : '';
@@ -827,13 +848,19 @@ export async function routeMessage(message: any): Promise<void> {
   );
 
   // Central Logging Hook
-  const logGroupJid = process.env.LOG_GROUP_JID;
-  if (logGroupJid && logGroupJid !== sender) {
+  const logGroupJidStr = process.env.LOG_GROUP_JID;
+  const logGroupJid = logGroupJidStr ? ensureJidSuffix(logGroupJidStr) : undefined;
+
+  if (logGroupJidStr && !logGroupJid) {
+    customLogger.warn(`LOG_GROUP_JID is configured but invalid: "${logGroupJidStr}". Logger disabled.`);
+  }
+
+  if (logGroupJid && logGroupJid !== normalizedChatJid) {
     let shouldLog = false;
     let logReason = "";
 
     if (isDm) {
-      const chatState = await getApprovalState(sender);
+      const chatState = await getApprovalState(normalizedChatJid);
       if (!chatState.approved && !chatState.stopped) {
         shouldLog = true;
         logReason = "Incoming DM from unapproved user";
@@ -844,13 +871,13 @@ export async function routeMessage(message: any): Promise<void> {
     }
 
     if (shouldLog) {
-      const cleanSender = sender.split('@')[0];
       const pushName = message.pushName || "Unknown";
+      const logText = (text || '').trim() || "[Media or Empty Message]";
       const logMessage = [
         `🔔 *ULTRON LOG ENGINE* ────────────────`,
         `🚨 *Reason:* ${logReason}`,
         `👤 *User:* ${pushName} (${cleanSender})`,
-        `💬 *Message:* ${text}`,
+        `💬 *Message:* ${logText}`,
       ].join('\n');
 
       if (socket) {
@@ -867,16 +894,16 @@ export async function routeMessage(message: any): Promise<void> {
     const durationStr = formatAfkDuration(Date.now() - afkState.startTime);
     const afkResponse = `⏳ *Aayush is currently AFK* ────────────────\n📝 *Reason:* ${afkState.reason}\n⏰ *Away for:* ${durationStr}\n\n_Please leave your message. The system will alert him when he returns._`;
     try {
-      await socket.sendMessage(sender, { text: afkResponse });
+      await socket.sendMessage(normalizedChatJid, { text: afkResponse });
     } catch (err) {
-      customLogger.error(`Failed to send AFK reply to ${sender}`, err);
+      customLogger.error(`Failed to send AFK reply to ${normalizedChatJid}`, err);
     }
     return;
   }
 
   // 2. DM Gating logic
   if (isDm) {
-    const chatState = await getApprovalState(sender);
+    const chatState = await getApprovalState(normalizedChatJid);
     if (chatState.stopped) {
       // Manual control deactivates AI/Gate responses
       return;
@@ -888,18 +915,18 @@ export async function routeMessage(message: any): Promise<void> {
       customLogger.system(`Generating auto AI response for approved chat ${cleanSender}...`);
       try {
         const { text: aiResponse } = await generateAiResponse(text);
-        await socket.sendMessage(sender, { text: aiResponse });
+        await socket.sendMessage(normalizedChatJid, { text: aiResponse });
       } catch (err: any) {
         customLogger.error(`Auto AI response failed for ${cleanSender}`, err);
       }
     } else {
       // Unapproved: Send exactly ONE gate greeting message
-      if (!sentGateMessages.has(sender)) {
-        sentGateMessages.add(sender);
+      if (!sentGateMessages.has(normalizedChatJid)) {
+        sentGateMessages.add(normalizedChatJid);
         const greeting = getDynamicGreeting();
         const gateText = `_${greeting}! My master is busy with some stuff. Please drop your message if it's too urgent or else wait until my master responds._`;
         try {
-          await socket.sendMessage(sender, { text: gateText });
+          await socket.sendMessage(normalizedChatJid, { text: gateText });
         } catch (err) {
           customLogger.error(`Failed to send gate message to ${cleanSender}`, err);
         }

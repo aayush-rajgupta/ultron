@@ -170,3 +170,49 @@ test('Central Logger Hook - forwards explicit group mention to LOG_GROUP_JID', a
   assert.match(sentMessages[0].text, /Explicit group mention/);
   assert.match(sentMessages[0].text, /hey @916263506758 how is it going\?/);
 });
+
+test('PluginRuntime - typewriter animation frame cap is enforced', async () => {
+  const runtime = new PluginRuntime('owner');
+  const editedFrames: string[] = [];
+  const context = {
+    sender: 'owner',
+    owner: 'owner',
+    editMessage: async (text: string) => {
+      editedFrames.push(text);
+    }
+  };
+
+  const longText = "This is a very long string designed to exceed the 15 frame mutation limit to verify that the step computation works correctly.";
+  const typeRes = await runtime.dispatch('type', { ...context, args: [longText] } as any);
+  assert.equal(typeRes, longText);
+  assert.ok(editedFrames.length <= 15);
+});
+
+test('Central Logger Hook - media payload safety', async () => {
+  const sentMessages: { jid: string; text: string }[] = [];
+  const mockSocket = {
+    user: { id: "916263506758@s.whatsapp.net" },
+    sendMessage: async (jid: string, content: any) => {
+      sentMessages.push({ jid, text: content.text });
+      return { key: { id: "mock-id" } };
+    }
+  };
+  mainModule.setSocket(mockSocket as any);
+  
+  process.env.LOG_GROUP_JID = "1203630248@g.us";
+
+  const msg = {
+    key: { id: "msg-media-log", remoteJid: "919999999999@s.whatsapp.net", fromMe: false },
+    message: {
+      imageMessage: {
+        // missing caption
+      }
+    },
+    messageTimestamp: Math.floor((Date.now() + 10000) / 1000)
+  };
+  await mainModule.routeMessage(msg);
+
+  const logMessage = sentMessages.find(m => m.jid === "1203630248@g.us");
+  assert.ok(logMessage);
+  assert.match(logMessage.text, /\[Media or Empty Message\]/);
+});

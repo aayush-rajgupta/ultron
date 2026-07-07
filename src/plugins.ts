@@ -262,9 +262,15 @@ export class PluginRuntime {
             if (!textToType) return "Usage: !type <text>";
             if (ctx.editMessage) {
               let currentText = "";
-              for (let i = 0; i < textToType.length; i++) {
-                currentText += textToType[i];
-                await ctx.editMessage(`${currentText}|`);
+              const maxFrames = 15;
+              const step = Math.max(1, Math.ceil(textToType.length / maxFrames));
+              for (let i = 0; i < textToType.length; i += step) {
+                currentText = textToType.substring(0, i + step);
+                try {
+                  await ctx.editMessage(`${currentText}|`);
+                } catch {
+                  break;
+                }
                 await new Promise((resolve) => setTimeout(resolve, 150));
               }
             }
@@ -281,7 +287,11 @@ export class PluginRuntime {
                 { bar: "[██████████]", pct: 100 },
               ];
               for (const frame of frames) {
-                await ctx.editMessage(`⏳ *Loading:* ${frame.bar} ${frame.pct}%`);
+                try {
+                  await ctx.editMessage(`⏳ *Loading:* ${frame.bar} ${frame.pct}%`);
+                } catch {
+                  break;
+                }
                 await new Promise((resolve) => setTimeout(resolve, 200));
               }
             }
@@ -291,7 +301,11 @@ export class PluginRuntime {
             const clocks = ["🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘", "🕙", "🕚", "🕛"];
             if (ctx.editMessage) {
               for (const clock of clocks) {
-                await ctx.editMessage(`🕒 Time Matrix: ${clock}`);
+                try {
+                  await ctx.editMessage(`🕒 Time Matrix: ${clock}`);
+                } catch {
+                  break;
+                }
                 await new Promise((resolve) => setTimeout(resolve, 150));
               }
             }
