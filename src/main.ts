@@ -1213,7 +1213,6 @@ export async function routeMessage(message: any): Promise<void> {
       const canNotify = await tryAtomicMarkGateNotified(normalizedChatJid, gateCooldownMs);
       if (!canNotify) {
         customLogger.system(`Gate message suppressed for ${contact.pushName} due to cooldown.`);
-        return;
       }
 
       if (isUrgent) {
@@ -1221,7 +1220,7 @@ export async function routeMessage(message: any): Promise<void> {
       }
 
       const history = await getChatHistory(contact.phoneNumber);
-      const isFirstContact = history.length === 0;
+      const isFirstContact = canNotify;
 
       let promptText = text;
       if (isUrgent) {

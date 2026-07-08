@@ -104,14 +104,53 @@ test('v4.0 Bouncer Cooldown - gate message suppressed on repeat', async () => {
   assert.equal(sentMessages.length, 1);
   assert.equal(sentMessages[0].text, "AI Bouncer Response");
 
-  // Second message immediately -> gate response suppressed due to 3-hour cooldown
+  // Second message immediately -> formal greeting suppressed but dynamic reply still sent
   const msg2 = {
     key: { id: "msg-2", remoteJid: "919999999999@s.whatsapp.net", fromMe: false },
     message: { conversation: "hello again" },
     messageTimestamp: Math.floor((Date.now() + 12000) / 1000)
   };
   await mainModule.routeMessage(msg2);
-  assert.equal(sentMessages.length, 1); // No new message sent
+  assert.equal(sentMessages.length, 2);
+  assert.equal(sentMessages[1].text, "AI Bouncer Response");
+});
+
+test('v4.0 Gemini Pooling - failover on generic API error', async () => {
+  process.env.AI_PROVIDER_PRIORITY = "Gemini";
+  process.env.GEMINI_API_KEYS = "key1,key2,key3";
+
+  const fetchCalls: string[] = [];
+
+  globalThis.fetch = async (url, options) => {
+    const urlStr = typeof url === 'string' ? url : url.toString();
+    if (urlStr.includes('generativelanguage.googleapis.com')) {
+      const key = urlStr.split('key=')[1];
+      fetchCalls.push(key);
+
+      if (key === 'key1') {
+        // Return 500 to trigger rotation on generic error
+        return {
+          ok: false,
+          status: 500,
+          text: async () => "Internal server error"
+        } as any;
+      }
+      if (key === 'key2') {
+        // Return success
+        return {
+          ok: true,
+          json: async () => ({
+            candidates: [{ content: { parts: [{ text: "Success from Key 2 on 500 failover!" }] } }]
+          })
+        } as any;
+      }
+    }
+    throw new Error("Unexpected URL: " + urlStr);
+  };
+
+  const res = await generateAiResponse("test message");
+  assert.equal(res.text, "Success from Key 2 on 500 failover!");
+  assert.deepEqual(fetchCalls, ["key1", "key2"]);
 });
 
 test('v4.0 Semantic Emergency Confirmation - triggers alert email on affirmation', async () => {

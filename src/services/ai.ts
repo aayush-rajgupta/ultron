@@ -263,12 +263,35 @@ async function callGemini(messages: ChatMessage[]): Promise<string> {
         continue;
       }
 
+      if (keys.length > 1) {
+        const oldIndex = currentIndex;
+        currentIndex = (currentIndex + 1) % keys.length;
+
+        if (redisConnected && redis.isOpen) {
+          try {
+            await redis.set('ultron:gemini_key_index', currentIndex.toString());
+          } catch (e) {}
+        }
+        fallbackKeyIndex = currentIndex;
+
+        customLogger.warn(JSON.stringify({
+          event: "KEY_ROTATION",
+          reason: "api_error",
+          failed_index: oldIndex,
+          next_index: currentIndex,
+          error: errMessage
+        }));
+
+        attempts++;
+        continue;
+      }
+
       customLogger.error(`Genuine error on Gemini key index ${currentIndex}: ${errMessage}`);
       throw err;
     }
   }
 
-  throw new Error("All Gemini keys are currently cooling down.");
+  throw new Error("All Gemini keys are currently cooling down or failed.");
 }
 
 async function callOpenAI(messages: ChatMessage[]): Promise<string> {
