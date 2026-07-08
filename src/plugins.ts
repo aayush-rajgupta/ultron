@@ -217,11 +217,13 @@ export class PluginRuntime {
         description: "DM Gate and AFK Control commands.",
         commands: [
           { name: "approve", description: "Approve a JID for AI chatbot", usage: "!approve", ownerOnly: true },
+          { name: "unapprove", description: "Reset approval state for a JID", usage: "!unapprove", ownerOnly: true },
+          { name: "bouncer", description: "Reset approval state for a JID", usage: "!bouncer", ownerOnly: true },
           { name: "stop", description: "Pause AI chatbot for a JID", usage: "!stop", ownerOnly: true },
           { name: "afk", description: "Activate AFK mode", usage: "!afk [reason]", ownerOnly: true },
         ],
         execute: async (ctx) => {
-          const { setApprovalState, setAfkState } = await import('./main');
+          const { setApprovalState, setAfkState, sanitizeAfkReason } = await import('./main');
           if (ctx.command === 'approve') {
             const targetJid = ctx.chatJid || ctx.sender;
             if (!targetJid || targetJid.endsWith('@g.us') || targetJid.includes('broadcast')) {
@@ -229,6 +231,14 @@ export class PluginRuntime {
             }
             await setApprovalState(targetJid, { approved: true, stopped: false });
             return `✅ Access Granted. AI Bouncer deactivated for this chat.`;
+          }
+          if (ctx.command === 'unapprove' || ctx.command === 'bouncer') {
+            const targetJid = ctx.chatJid || ctx.sender;
+            if (!targetJid || targetJid.endsWith('@g.us') || targetJid.includes('broadcast')) {
+              return '❌ Please run this command in a direct message chat.';
+            }
+            await setApprovalState(targetJid, { approved: false, stopped: false });
+            return `Approval reset. Front door re-enabled for this chat.`;
           }
           if (ctx.command === 'stop') {
             const targetJid = ctx.chatJid || ctx.sender;
@@ -239,7 +249,8 @@ export class PluginRuntime {
             return `🛑 *AI Deactivated*: Auto-Response has been paused for this chat. Shifting to manual control.`;
           }
           if (ctx.command === 'afk') {
-            const reason = ctx.args.join(' ') || 'Away from keyboard';
+            const rawReason = ctx.args.join(' ') || 'Away from keyboard';
+            const reason = sanitizeAfkReason(rawReason);
             await setAfkState(true, reason, Date.now());
             return `💤 *ULTRON OS: AFK Mode Activated*\nReason: ${reason}`;
           }

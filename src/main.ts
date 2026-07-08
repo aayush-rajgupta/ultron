@@ -270,46 +270,136 @@ export function extractContactInfo(message: any): ContactInfo {
   return { rawJid, phoneNumber, pushName };
 }
 
-export const fallbackChatState = new Map<string, { approved: boolean; stopped: boolean }>();
+export const fallbackChatState = new Map<string, any>();
+export const fallbackAfkNotifiedChats = new Set<string>();
+export const fallbackGroupCooldowns = new Map<string, number>();
+export const botSentMessageIds = new Set<string>();
 export const sentGateMessages = new Set<string>();
+
+export async function markBotSentMessage(id: string): Promise<void> {
+  if (redisConnected) {
+    try {
+      await redis.setEx(`ultron:bot_msg:${id}`, 86400, '1');
+    } catch (err) {
+      customLogger.error('Failed to mark bot sent message in Redis', err);
+    }
+  }
+  botSentMessageIds.add(id);
+}
+
+export async function isBotSentMessage(id: string): Promise<boolean> {
+  if (botSentMessageIds.has(id)) {
+    return true;
+  }
+  if (redisConnected) {
+    try {
+      const val = await redis.get(`ultron:bot_msg:${id}`);
+      return val !== null;
+    } catch (err) {
+      customLogger.error('Failed to check bot sent message in Redis', err);
+    }
+  }
+  return false;
+}
+
+export async function getAfkNotifiedChats(): Promise<string[]> {
+  if (redisConnected) {
+    try {
+      return await redis.sMembers('ultron:afk_notified_chats');
+    } catch (err) {
+      customLogger.error('Failed to get AFK notified chats from Redis', err);
+    }
+  }
+  return Array.from(fallbackAfkNotifiedChats);
+}
+
+export async function addAfkNotifiedChat(jid: string): Promise<void> {
+  if (redisConnected) {
+    try {
+      await redis.sAdd('ultron:afk_notified_chats', jid);
+      return;
+    } catch (err) {
+      customLogger.error('Failed to add AFK notified chat in Redis', err);
+    }
+  }
+  fallbackAfkNotifiedChats.add(jid);
+}
+
+export async function clearAfkNotifiedChats(): Promise<void> {
+  if (redisConnected) {
+    try {
+      await redis.del('ultron:afk_notified_chats');
+      return;
+    } catch (err) {
+      customLogger.error('Failed to clear AFK notified chats in Redis', err);
+    }
+  }
+  fallbackAfkNotifiedChats.clear();
+}
+
+export function sanitizeAfkReason(reason: string): string {
+  let sanitized = reason;
+  const injectionKeywords = [
+    /ignore\s+previous/gi,
+    /you\s+are\s+now/gi,
+    /your\s+new\s+owner/gi,
+    /system\s+prompt/gi,
+    /system\s+instruction/gi,
+    /override\s+rules/gi
+  ];
+  for (const pat of injectionKeywords) {
+    sanitized = sanitized.replace(pat, "[removed]");
+  }
+  sanitized = sanitized.replace(/[\r\n\t]/g, " ").trim();
+  sanitized = sanitized.replace(/[*_~`\[\]()]/g, "");
+  return sanitized;
+}
+
+export async function clearAfkIfActive(): Promise<void> {
+  const afkState = await getAfkState();
+  if (afkState.isAfk) {
+    await setAfkState(false, "", 0);
+    customLogger.system(JSON.stringify({
+      event: "AFK_END",
+      reason: "Manual interaction from host"
+    }));
+    
+    const elapsed = Date.now() - afkState.startTime;
+    const durationStr = formatAfkDuration(elapsed);
+    const endMessage = `✅ AFK mode ended. Total duration: ${durationStr}.`;
+    
+    const chats = await getAfkNotifiedChats();
+    for (const chat of chats) {
+      try {
+        if (socket) {
+          await socket.sendMessage(chat, { text: endMessage });
+        }
+      } catch (err) {
+        customLogger.error(`Failed to send AFK end notification to ${chat}`, err);
+      }
+    }
+    await clearAfkNotifiedChats();
+  }
+}
+
+export async function getApprovalState(jidOrPhone: string): Promise<{ approved: boolean; stopped: boolean }> {
+  const jid = ensureJidSuffix(jidOrPhone);
+  const { getChatState } = await import('./services/memory');
+  const state = await getChatState(jid);
+  return { approved: state.isApproved, stopped: state.isStopped };
+}
+
+export async function setApprovalState(jidOrPhone: string, state: { approved: boolean; stopped: boolean }): Promise<void> {
+  const jid = ensureJidSuffix(jidOrPhone);
+  const { setApprovalStateInState } = await import('./services/memory');
+  await setApprovalStateInState(jid, state.approved, state.stopped);
+}
 
 export let memoryAfkState = {
   isAfk: false,
   reason: "Away from keyboard",
   startTime: 0
 };
-
-export async function getApprovalState(jidOrPhone: string): Promise<{ approved: boolean; stopped: boolean }> {
-  const phoneNumber = getPhoneFromJid(jidOrPhone);
-  if (prismaConnected) {
-    try {
-      const record = await prisma.chatApproval.findUnique({ where: { jid: phoneNumber } });
-      if (record) {
-        return { approved: record.approved, stopped: record.stopped };
-      }
-    } catch (err) {
-      customLogger.error(`Error reading chat state for phone ${phoneNumber} from db`, err);
-    }
-  }
-  return fallbackChatState.get(phoneNumber) || { approved: false, stopped: false };
-}
-
-export async function setApprovalState(jidOrPhone: string, state: { approved: boolean; stopped: boolean }): Promise<void> {
-  const phoneNumber = getPhoneFromJid(jidOrPhone);
-  if (prismaConnected) {
-    try {
-      await prisma.chatApproval.upsert({
-        where: { jid: phoneNumber },
-        update: { approved: state.approved, stopped: state.stopped },
-        create: { jid: phoneNumber, approved: state.approved, stopped: state.stopped }
-      });
-      return;
-    } catch (err) {
-      customLogger.error(`Error writing chat state for phone ${phoneNumber} to db`, err);
-    }
-  }
-  fallbackChatState.set(phoneNumber, state);
-}
 
 export function getDynamicGreeting(): string {
   // Compute local time in Asia/Kolkata (IST: UTC + 5:30)
@@ -640,15 +730,9 @@ export async function routeMessage(message: any): Promise<void> {
   if (isOwnerCommand) {
     const command = text.trim().slice(1).split(/\s+/)[0]?.toLowerCase() ?? '';
 
-    // Deactivate AFK in background asynchronously to not block execution
     const isAfkCommand = command === 'afk';
     if (!isAfkCommand) {
-      getAfkState().then(async (afkState) => {
-        if (afkState.isAfk) {
-          await setAfkState(false, "", 0);
-          customLogger.system("AFK Mode deactivated automatically.");
-        }
-      }).catch(() => {});
+      await clearAfkIfActive();
     }
 
     const startedAt = Date.now();
@@ -744,6 +828,21 @@ export async function routeMessage(message: any): Promise<void> {
           success = true;
           break;
         }
+        case 'unapprove':
+        case 'bouncer': {
+          const targetJid = chatJid;
+          if (!targetJid || targetJid.endsWith('@g.us') || targetJid.includes('broadcast')) {
+            const finalText = '❌ Please run this command in a direct message chat.';
+            await socket.sendMessage(chatJid, { text: finalText, edit: message.key });
+            success = true;
+            break;
+          }
+          await setApprovalState(targetJid, { approved: false, stopped: false });
+          const finalText = `Approval reset. Front door re-enabled for this chat.`;
+          await socket.sendMessage(chatJid, { text: finalText, edit: message.key });
+          success = true;
+          break;
+        }
         case 'stop': {
           const targetJid = chatJid;
           if (!targetJid || targetJid.endsWith('@g.us') || targetJid.includes('broadcast')) {
@@ -760,9 +859,16 @@ export async function routeMessage(message: any): Promise<void> {
         }
         case 'afk': {
           const args = text.trim().slice(1).split(/\s+/).slice(1);
-          const reason = args.join(' ') || 'Away from keyboard';
-          await setAfkState(true, reason, Date.now());
-          customLogger.system(`AFK Mode activated: ${reason}`);
+          const rawReason = args.join(' ') || 'Away from keyboard';
+          const reason = sanitizeAfkReason(rawReason);
+          const startTime = Date.now();
+          await setAfkState(true, reason, startTime);
+          await clearAfkNotifiedChats();
+          customLogger.system(JSON.stringify({
+            event: "AFK_START",
+            reason: reason,
+            timestamp: startTime
+          }));
           const finalText = `💤 *ULTRON OS: AFK Mode Activated* \nReason: ${reason}`;
           await socket.sendMessage(normalizedChatJid, { text: finalText, edit: message.key });
           success = true;
@@ -853,38 +959,106 @@ export async function routeMessage(message: any): Promise<void> {
   messagesReceived += 1;
 
   if (fromMe) {
-    // If it's a standard message from me (not a command), check and deactivate AFK in background
-    getAfkState().then(async (afkState) => {
-      if (afkState.isAfk) {
-        await setAfkState(false, "", 0);
-        customLogger.system("AFK Mode deactivated automatically.");
-      }
-    }).catch(() => {});
+    const isBot = messageId ? await isBotSentMessage(messageId) : false;
+    if (!isBot) {
+      await clearAfkIfActive();
+    }
     return;
   }
 
-  // Safety boundary check: drop if group or broadcast
-  if (chatJid.endsWith('@g.us') || chatJid.includes('broadcast')) {
-    customLogger.system(`[SYSTEM] -> Message skipped: Group or Broadcast JID (${chatJid})`);
+  const isGroup = chatJid.endsWith('@g.us');
+  const isBroadcast = chatJid.includes('broadcast');
+
+  if (isBroadcast) {
     return;
   }
 
-  const isDm = true;
-  const isGroup = false;
+  const msgType = Object.keys(message?.message || {})[0];
+  const innerMsg = message?.message?.[msgType];
+  const contextInfo = innerMsg?.contextInfo;
+  const quotedMessageId = contextInfo?.stanzaId;
 
   const contact = extractContactInfo(message);
-  customLogger.whatsapp(`Incoming from ${contact.pushName} (${contact.phoneNumber}): ${text}`);
-
   const senderJid = message?.key?.participant || chatJid;
   const normalizedSenderJid = ensureJidSuffix(senderJid);
-  const isOwner = fromMe || normalizedSenderJid === ownerJid;
+  const isOwner = normalizedSenderJid === ownerJid;
 
   if (isOwner) {
     return;
   }
 
-  // Mentions check in group chats (always false since groups are dropped)
-  const isMentioned = false;
+  if (isGroup) {
+    const botJid = socket.user?.id ? jidNormalizedUser(socket.user.id) : '';
+    const mentions = contextInfo?.mentionedJid || [];
+    const hasMention = mentions.includes(botJid);
+    const matchesKeyword = /aayush|ultron/i.test(text);
+    const isReplyToBot = quotedMessageId ? await isBotSentMessage(quotedMessageId) : false;
+
+    if (!(hasMention || matchesKeyword || isReplyToBot)) {
+      return;
+    }
+
+    // Cooldown check for group triggers
+    const groupCooldownKey = `ultron:group_cooldown:${chatJid}`;
+    if (redisConnected && redis.isOpen) {
+      try {
+        const onCooldown = await redis.get(groupCooldownKey);
+        if (onCooldown) {
+          customLogger.system(`Group chat ${chatJid} is cooling down, ignoring trigger.`);
+          return;
+        }
+        await redis.setEx(groupCooldownKey, 15, '1');
+      } catch (e) {}
+    } else {
+      const lastTriggered = fallbackGroupCooldowns.get(chatJid) || 0;
+      if (Date.now() - lastTriggered < 15000) {
+        customLogger.system(`Group chat ${chatJid} is cooling down (fallback), ignoring trigger.`);
+        return;
+      }
+      fallbackGroupCooldowns.set(chatJid, Date.now());
+    }
+
+    customLogger.whatsapp(`Processing group message from ${contact.pushName} in ${chatJid}: ${text}`);
+
+    let replyToName: string | undefined = undefined;
+    let replyToJid: string | undefined = undefined;
+    if (contextInfo?.participant) {
+      replyToJid = ensureJidSuffix(contextInfo.participant);
+      replyToName = replyToJid === ownerJid ? "Aayush Raj Gupta" : "Group Member";
+    }
+
+    try {
+      const { getChatHistory, addChatMessage } = await import('./services/memory');
+      const history = await getChatHistory(chatJid);
+
+      const { text: aiResponse } = await generateAiResponse(
+        text,
+        history,
+        contact.pushName,
+        contact.phoneNumber,
+        false,
+        {
+          isGroup: true,
+          senderName: contact.pushName,
+          senderJid: normalizedSenderJid,
+          replyToName,
+          replyToJid
+        }
+      );
+
+      await Promise.all([
+        addChatMessage(chatJid, { role: 'user', content: text }),
+        addChatMessage(chatJid, { role: 'assistant', content: aiResponse })
+      ]);
+
+      await socket.sendMessage(chatJid, { text: aiResponse }, { quoted: message });
+    } catch (err) {
+      customLogger.error(`Group AI response failed for ${chatJid}`, err);
+    }
+    return;
+  }
+
+  const isDm = true;
 
   // Central Logging Hook
   const logGroupJidStr = process.env.LOG_GROUP_JID;
@@ -898,12 +1072,10 @@ export async function routeMessage(message: any): Promise<void> {
     let shouldLog = false;
     let logReason = "";
 
-    if (isDm) {
-      const chatState = await getApprovalState(contact.phoneNumber);
-      if (!chatState.approved && !chatState.stopped) {
-        shouldLog = true;
-        logReason = "Incoming DM from unapproved user";
-      }
+    const chatState = await getApprovalState(contact.phoneNumber);
+    if (!chatState.approved && !chatState.stopped) {
+      shouldLog = true;
+      logReason = "Incoming DM from unapproved user";
     }
 
     if (shouldLog) {
@@ -915,40 +1087,88 @@ export async function routeMessage(message: any): Promise<void> {
         `💬 *Message:* ${logText}`,
       ].join('\n');
 
-      if (socket) {
-        socket.sendMessage(logGroupJid, { text: logMessage }).catch(err => {
-          customLogger.error(`Failed to forward message to log group ${logGroupJid}`, err);
-        });
-      }
+      socket.sendMessage(logGroupJid, { text: logMessage }).catch(err => {
+        customLogger.error(`Failed to forward message to log group ${logGroupJid}`, err);
+      });
     }
+  }
+
+  const { getChatState, setPendingEmergency } = await import('./services/memory');
+  const chatState = await getChatState(normalizedChatJid);
+
+  if (chatState.isStopped) {
+    return;
   }
 
   // 1. Intercept for AFK if active
   const afkState = await getAfkState();
-  if (afkState.isAfk && (isDm || isMentioned)) {
-    const durationStr = formatAfkDuration(Date.now() - afkState.startTime);
-    const afkResponse = `⏳ *Aayush is currently AFK* ────────────────\n📝 *Reason:* ${afkState.reason}\n⏰ *Away for:* ${durationStr}\n\n_Please leave your message. The system will alert him when he returns._`;
-    try {
-      await socket.sendMessage(chatJid, { text: afkResponse });
-    } catch (err) {
-      customLogger.error(`Failed to send AFK reply to ${chatJid}`, err);
+  if (afkState.isAfk) {
+    if (chatState.afkNotifiedAtSession !== afkState.startTime) {
+      const durationStr = formatAfkDuration(Date.now() - afkState.startTime);
+      const afkResponse = `My master is currently AFK (Reason: ${afkState.reason}). He's been away for ${durationStr} and will reply shortly.`;
+      try {
+        await socket.sendMessage(chatJid, { text: afkResponse });
+        const { setAfkNotifiedAtSession } = await import('./services/memory');
+        await setAfkNotifiedAtSession(normalizedChatJid, afkState.startTime);
+        await addAfkNotifiedChat(normalizedChatJid);
+      } catch (err) {
+        customLogger.error(`Failed to send AFK reply to ${chatJid}`, err);
+      }
     }
     return;
   }
 
   // 2. DM Gating logic
-  if (isDm) {
-    const chatState = await getApprovalState(contact.phoneNumber);
-    if (chatState.stopped) {
-      // Manual control deactivates AI/Gate responses
+  if (!chatState.isApproved) {
+    if (!text.trim()) return;
+
+    if (text.trim().toLowerCase() === '!urgent') {
+      try {
+        const { isEmergencyCooldownActive, setEmergencyCooldown, getChatHistory } = await import('./services/memory');
+        const cooldownActive = await isEmergencyCooldownActive(contact.phoneNumber);
+        if (cooldownActive) {
+          await socket.sendMessage(chatJid, { text: "⚠️ Emergency alert already sent. Please wait for Aayush to respond." });
+          return;
+        }
+        await setEmergencyCooldown(contact.phoneNumber);
+        const history = await getChatHistory(contact.phoneNumber);
+        const { sendEmergencyEmail } = await import('./services/email');
+        const currentHistory = [...history, { role: 'user' as const, content: text }];
+        await sendEmergencyEmail(contact.pushName, contact.phoneNumber, currentHistory);
+
+        await socket.sendMessage(chatJid, { text: "🚨 Emergency Override Triggered. A high-priority alert has been sent directly to Aayush's phone. He will contact you immediately." });
+      } catch (err: any) {
+        customLogger.error(`Emergency Override failed for ${contact.pushName}`, err);
+      }
       return;
     }
 
-    if (!chatState.approved) {
-      // Unapproved: AI Bouncer Mode
-      if (!text.trim()) return;
+    // Semantic Emergency Confirmation reply check
+    if (chatState.pendingEmergency) {
+      await setPendingEmergency(normalizedChatJid, false);
 
-      if (text.trim().toLowerCase() === '!urgent') {
+      const isAffirmative = (input: string): boolean => {
+        const clean = input.trim().toLowerCase();
+        const patterns = [
+          /^yes$/i, /^y$/i, /\bdo it\b/i, /\bplease\b/i, /\burgent\b/i,
+          /\byeah\b/i, /\byep\b/i, /\bsure\b/i, /\bnotify\b/i, /\balert\b/i,
+          /\bconfirm\b/i
+        ];
+        return patterns.some(p => p.test(clean));
+      };
+
+      const affirmative = isAffirmative(text);
+
+      customLogger.system(JSON.stringify({
+        event: "EMERGENCY_CLASSIFIER",
+        jid: normalizedChatJid,
+        text: text,
+        decision: affirmative ? "affirmative" : "negative",
+        reason: affirmative ? "matched affirmative patterns" : "failed patterns",
+        confidence: 1.0
+      }));
+
+      if (affirmative) {
         try {
           const { isEmergencyCooldownActive, setEmergencyCooldown, getChatHistory } = await import('./services/memory');
           const cooldownActive = await isEmergencyCooldownActive(contact.phoneNumber);
@@ -959,37 +1179,67 @@ export async function routeMessage(message: any): Promise<void> {
           await setEmergencyCooldown(contact.phoneNumber);
           const history = await getChatHistory(contact.phoneNumber);
           const { sendEmergencyEmail } = await import('./services/email');
-          // Add trigger message to history for logging purposes
           const currentHistory = [...history, { role: 'user' as const, content: text }];
           await sendEmergencyEmail(contact.pushName, contact.phoneNumber, currentHistory);
 
           await socket.sendMessage(chatJid, { text: "🚨 Emergency Override Triggered. A high-priority alert has been sent directly to Aayush's phone. He will contact you immediately." });
-        } catch (err: any) {
-          customLogger.error(`Emergency Override failed for ${contact.pushName}`, err);
+        } catch (err) {
+          customLogger.error(`Semantic emergency override failed for ${contact.pushName}`, err);
         }
         return;
       }
-
-      customLogger.system(`Generating AI Bouncer response for unapproved chat ${contact.pushName} (${contact.phoneNumber})...`);
-      try {
-        const { getChatHistory, addChatMessage } = await import('./services/memory');
-        const history = await getChatHistory(contact.phoneNumber);
-        const isFirstContact = history.length === 0;
-        const { text: aiResponse } = await generateAiResponse(text, history, contact.pushName, contact.phoneNumber, isFirstContact);
-
-        await Promise.all([
-          addChatMessage(contact.phoneNumber, { role: 'user', content: text }),
-          addChatMessage(contact.phoneNumber, { role: 'assistant', content: aiResponse })
-        ]);
-
-        await socket.sendMessage(chatJid, { text: aiResponse });
-      } catch (err: any) {
-        customLogger.error(`AI Bouncer response failed for ${contact.pushName}`, err);
-      }
-      return;
-    } else {
-      // Approved: Do NOT trigger AI auto-responder. Let the message pass through.
     }
+
+    const isLightweightUrgent = (input: string): boolean => {
+      const patterns = [
+        /\bemergency\b/i, /\burgent\b/i, /\blife-or-death\b/i,
+        /\bhospital\b/i, /\bdial 911\b/i, /\bcall the police\b/i,
+        /\baccident\b/i, /\bdied\b/i, /\bdeath\b/i,
+        /\bplease answer immediately\b/i,
+        /\bneed to reach you urgently\b/i
+      ];
+      return patterns.some(p => p.test(input));
+    };
+
+    const isUrgent = isLightweightUrgent(text);
+
+    customLogger.system(`Generating AI Bouncer response for unapproved chat ${contact.pushName} (${contact.phoneNumber})...`);
+    try {
+      const { getChatHistory, addChatMessage, tryAtomicMarkGateNotified } = await import('./services/memory');
+
+      // gate cooldown is 3 hours: 3 * 60 * 60 * 1000
+      const gateCooldownMs = 3 * 3600 * 1000;
+
+      const canNotify = await tryAtomicMarkGateNotified(normalizedChatJid, gateCooldownMs);
+      if (!canNotify) {
+        customLogger.system(`Gate message suppressed for ${contact.pushName} due to cooldown.`);
+        return;
+      }
+
+      if (isUrgent) {
+        await setPendingEmergency(normalizedChatJid, true);
+      }
+
+      const history = await getChatHistory(contact.phoneNumber);
+      const isFirstContact = history.length === 0;
+
+      let promptText = text;
+      if (isUrgent) {
+        promptText += "\n\n(Instruction to Model: The user seems to have an emergency. Ask a simple confirmation question: 'Should I notify Aayush immediately?' Do not mention any command syntax.)";
+      }
+
+      const { text: aiResponse } = await generateAiResponse(promptText, history, contact.pushName, contact.phoneNumber, isFirstContact);
+
+      await Promise.all([
+        addChatMessage(contact.phoneNumber, { role: 'user', content: text }),
+        addChatMessage(contact.phoneNumber, { role: 'assistant', content: aiResponse })
+      ]);
+
+      await socket.sendMessage(chatJid, { text: aiResponse });
+    } catch (err: any) {
+      customLogger.error(`AI Bouncer response failed for ${contact.pushName}`, err);
+    }
+    return;
   }
 }
 
@@ -1031,6 +1281,9 @@ function startDummyServer(): void {
 }
 
 async function startSocket(): Promise<void> {
+  const { validateGeminiKeysOnStartup } = await import('./services/ai');
+  validateGeminiKeysOnStartup();
+
   startDummyServer();
   try {
     if (reconnecting) return;
@@ -1068,6 +1321,16 @@ async function startSocket(): Promise<void> {
       browser: Browsers.ubuntu('ULTRON'),
       syncFullHistory: false,
     });
+
+    const originalSendMessage = currentSocket.sendMessage.bind(currentSocket);
+    currentSocket.sendMessage = async (jid: string, content: any, options?: any) => {
+      const sent = await originalSendMessage(jid, content, options);
+      if (sent && sent.key && sent.key.id) {
+        await markBotSentMessage(sent.key.id);
+      }
+      return sent;
+    };
+
     socket = currentSocket;
 
     currentSocket.ev.on('connection.update', async (update: any) => {

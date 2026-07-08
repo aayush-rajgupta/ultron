@@ -6,9 +6,11 @@ import { PluginRuntime, generateAiResponse } from '../src/plugins';
 const originalEnv = { ...process.env };
 const originalFetch = globalThis.fetch;
 
-test.afterEach(() => {
+test.afterEach(async () => {
   process.env = { ...originalEnv };
   globalThis.fetch = originalFetch;
+  const { resetGeminiPoolState } = await import('../src/services/ai');
+  resetGeminiPoolState();
 });
 
 test('generateAiResponse - success on first provider (Gemini)', async () => {
@@ -196,14 +198,14 @@ test('generateAiResponse - uses FIRST_CONTACT_SYSTEM_PROMPT when isFirstContact 
   
   assert.ok(capturedBody);
   const systemInstruction = capturedBody.systemInstruction?.parts?.[0]?.text || "";
-  assert.match(systemInstruction, /ULTRON v3.0/);
-  assert.match(systemInstruction, /Hi, this is ULTRON v3.0, Aayush Raj Gupta's AI assistant userbot\./);
+  assert.match(systemInstruction, /ULTRON v4.0/);
+  assert.match(systemInstruction, /Hi, this is ULTRON v4.0, Aayush Raj Gupta's AI assistant userbot\./);
   assert.match(systemInstruction, /ABSOLUTELY ZERO EMOJIS/);
   
   await generateAiResponse("test prompt", [], "PushName", "12345", false);
   
   const systemInstruction2 = capturedBody.systemInstruction?.parts?.[0]?.text || "";
-  assert.match(systemInstruction2, /NO EMOJIS/);
+  assert.match(systemInstruction2, /Do not use emojis/);
 });
 
 test('generateAiResponse - retrieves and injects master knowledge into system prompt', async () => {
