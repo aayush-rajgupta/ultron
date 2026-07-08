@@ -21,6 +21,7 @@ export interface PluginContext {
   state: RuntimeState;
   editMessage?: (text: string) => Promise<void>;
   chatJid?: string;
+  receivedAt?: number;
 }
 
 import { generateAiResponse } from './services/ai';
@@ -111,14 +112,17 @@ export class PluginRuntime {
         ],
         execute: async (ctx) => {
           if (ctx.command === "ping") {
-            const latency = Math.max(1, Math.round(Math.random() * 80 + 20));
+            const start = ctx.receivedAt || Date.now();
+            const latency = Date.now() - start;
             return `PONG ${latency}ms`;
           }
           if (ctx.command === "alive") {
             const { getPrismaStatus, getRedisStatus, getAfkState } = await import('./main');
+            const { getApiStatusRegistry } = await import('./services/ai');
             const prismaStatus = await getPrismaStatus();
             const redisStatus = await getRedisStatus();
             const afkState = await getAfkState();
+            const registry = await getApiStatusRegistry();
             
             const totalSeconds = Math.floor(process.uptime());
             const hours = Math.floor(totalSeconds / 3600);
@@ -128,6 +132,23 @@ export class PluginRuntime {
 
             const afkStr = afkState.isAfk ? `Active (Reason: ${afkState.reason})` : `Inactive`;
 
+            const emojiMap: Record<string, string> = {
+              "Alive": "🟢",
+              "Limit Reached (Cooling Down)": "🟡",
+              "Unreachable": "🔴"
+            };
+
+            const registryText = [
+              `🤖 *ULTRON v4.5 STATUS REGISTRY:*`,
+              `${emojiMap[registry["Gemini Key 1"]] || "🔴"} Gemini Key 1: ${registry["Gemini Key 1"]}`,
+              `${emojiMap[registry["Gemini Key 2"]] || "🔴"} Gemini Key 2: ${registry["Gemini Key 2"]}`,
+              `${emojiMap[registry["Gemini Reserved 1"]] || "🔴"} Gemini Reserved 1: ${registry["Gemini Reserved 1"]}`,
+              `${emojiMap[registry["Gemini Reserved 2"]] || "🔴"} Gemini Reserved 2: ${registry["Gemini Reserved 2"]}`,
+              `${emojiMap[registry["OpenAI"]] || "🔴"} OpenAI: ${registry["OpenAI"]}`,
+              `${emojiMap[registry["Claude"]] || "🔴"} Claude: ${registry["Claude"]}`,
+              `${emojiMap[registry["OpenRouter"]] || "🔴"} OpenRouter: ${registry["OpenRouter"]}`,
+            ].join('\n');
+
             return [
               "═ *ULTRON STATUS* ═",
               `⏱ *Uptime:* ${uptimeStr}`,
@@ -136,7 +157,9 @@ export class PluginRuntime {
               `💤 *AFK State:* ${afkStr}`,
               `🛡 *DM Gate:* Enabled (Greetings & AI Chatbot Active)`,
               `🛠 Plugins: ${ctx.state.pluginCount}`,
-              `🧠 AI Provider: ${ctx.state.aiProvider}`
+              `🧠 AI Provider: ${ctx.state.aiProvider}`,
+              ``,
+              registryText
             ].join("\n");
           }
           if (ctx.command === "neofetch") {

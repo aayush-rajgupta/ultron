@@ -32,7 +32,7 @@ test.afterEach(() => {
 
 test('v4.0 Gemini Pooling - failover across keys', async () => {
   process.env.AI_PROVIDER_PRIORITY = "Gemini";
-  process.env.GEMINI_API_KEYS = "key1,key2,key3";
+  process.env.GEMINI_API_KEYS = "key1,key2,key3,key4";
 
   const fetchCalls: string[] = [];
 
@@ -117,7 +117,7 @@ test('v4.0 Bouncer Cooldown - gate message suppressed on repeat', async () => {
 
 test('v4.0 Gemini Pooling - failover on generic API error', async () => {
   process.env.AI_PROVIDER_PRIORITY = "Gemini";
-  process.env.GEMINI_API_KEYS = "key1,key2,key3";
+  process.env.GEMINI_API_KEYS = "key1,key2,key3,key4";
 
   const fetchCalls: string[] = [];
 

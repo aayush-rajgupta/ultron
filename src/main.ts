@@ -712,6 +712,7 @@ export function ensureJidSuffix(jid: string): string {
 }
 
 export async function routeMessage(message: any): Promise<void> {
+  const receivedAt = Date.now();
   if (!socket) return;
   const text = extractText(message);
   const fromMe = message?.key?.fromMe === true;
@@ -740,7 +741,7 @@ export async function routeMessage(message: any): Promise<void> {
     try {
       switch (command) {
         case 'ping': {
-          const latencyMs = Date.now() - startedAt;
+          const latencyMs = Date.now() - receivedAt;
           const finalText = `*Pong!* ${latencyMs}ms`;
           await socket.sendMessage(normalizedChatJid, { text: finalText, edit: message.key });
           success = true;
@@ -765,6 +766,25 @@ export async function routeMessage(message: any): Promise<void> {
           const priorityStr = process.env.AI_PROVIDER_PRIORITY || "Gemini,OpenAI,Claude,OpenRouter,DeepSeek,Groq,Mistral,Cohere";
           const aiProvider = priorityStr.split(',')[0]?.trim() || 'Gemini';
 
+          const { getApiStatusRegistry } = await import('./services/ai');
+          const registry = await getApiStatusRegistry();
+          const emojiMap: Record<string, string> = {
+            "Alive": "🟢",
+            "Limit Reached (Cooling Down)": "🟡",
+            "Unreachable": "🔴"
+          };
+
+          const registryText = [
+            `🤖 *ULTRON v4.5 STATUS REGISTRY:*`,
+            `${emojiMap[registry["Gemini Key 1"]] || "🔴"} Gemini Key 1: ${registry["Gemini Key 1"]}`,
+            `${emojiMap[registry["Gemini Key 2"]] || "🔴"} Gemini Key 2: ${registry["Gemini Key 2"]}`,
+            `${emojiMap[registry["Gemini Reserved 1"]] || "🔴"} Gemini Reserved 1: ${registry["Gemini Reserved 1"]}`,
+            `${emojiMap[registry["Gemini Reserved 2"]] || "🔴"} Gemini Reserved 2: ${registry["Gemini Reserved 2"]}`,
+            `${emojiMap[registry["OpenAI"]] || "🔴"} OpenAI: ${registry["OpenAI"]}`,
+            `${emojiMap[registry["Claude"]] || "🔴"} Claude: ${registry["Claude"]}`,
+            `${emojiMap[registry["OpenRouter"]] || "🔴"} OpenRouter: ${registry["OpenRouter"]}`,
+          ].join('\n');
+
           const finalText = [
             `═ *ULTRON STATUS* ═`,
             `⏱ *Uptime:* ${uptimeStr}`,
@@ -773,7 +793,9 @@ export async function routeMessage(message: any): Promise<void> {
             `💤 *AFK State:* ${afkStr}`,
             `🛡 *DM Gate:* Enabled (Greetings & AI Chatbot Active)`,
             `🛠 Plugins: ${pluginCount}`,
-            `🧠 AI Provider: ${aiProvider}`
+            `🧠 AI Provider: ${aiProvider}`,
+            ``,
+            registryText
           ].join('\n');
           await socket.sendMessage(normalizedChatJid, { text: finalText, edit: message.key });
           success = true;
@@ -905,6 +927,7 @@ export async function routeMessage(message: any): Promise<void> {
               args,
               chatJid: normalizedChatJid,
               editMessage,
+              receivedAt,
             } as any);
 
             if (responseText && responseText !== "Owner-only command." && !responseText.startsWith("Unknown command:")) {
@@ -1031,7 +1054,11 @@ export async function routeMessage(message: any): Promise<void> {
       const { getChatHistory, addChatMessage } = await import('./services/memory');
       const history = await getChatHistory(chatJid);
 
-      const { text: aiResponse } = await generateAiResponse(
+      const { isReservedTask, generateReservedAiResponse } = await import('./services/ai');
+      const useReserved = isReservedTask(message, text);
+      const generator = useReserved ? generateReservedAiResponse : generateAiResponse;
+
+      const { text: aiResponse } = await generator(
         text,
         history,
         contact.pushName,
@@ -1227,7 +1254,11 @@ export async function routeMessage(message: any): Promise<void> {
         promptText += "\n\n(Instruction to Model: The user seems to have an emergency. Ask a simple confirmation question: 'Should I notify Aayush immediately?' Do not mention any command syntax.)";
       }
 
-      const { text: aiResponse } = await generateAiResponse(promptText, history, contact.pushName, contact.phoneNumber, isFirstContact);
+      const { isReservedTask, generateReservedAiResponse } = await import('./services/ai');
+      const useReserved = isReservedTask(message, text);
+      const generator = useReserved ? generateReservedAiResponse : generateAiResponse;
+
+      const { text: aiResponse } = await generator(promptText, history, contact.pushName, contact.phoneNumber, isFirstContact);
 
       await Promise.all([
         addChatMessage(contact.phoneNumber, { role: 'user', content: text }),

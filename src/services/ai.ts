@@ -52,18 +52,30 @@ async function fetchWithTimeout(
   }
 }
 
-let fallbackKeyIndex = 0;
-const fallbackCooldowns: Record<number, number> = {};
+let fallbackGeneralIndex = 0;
+let fallbackReservedIndex = 0;
+export const fallbackCooldowns: Record<number, number> = {};
+export const fallbackFailures: Record<number, number> = {};
+export const fallbackProviderCooldowns: Record<string, number> = {};
+export const fallbackProviderFailures: Record<string, number> = {};
 
 function getGeminiApiKeys(): string[] {
   const keysStr = process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || "";
-  return keysStr.split(",").map(k => k.trim()).filter(Boolean);
+  let keys = keysStr.split(",").map(k => k.trim()).filter(Boolean);
+  if (keys.length > 0 && keys.length < 4) {
+    const first = keys[0];
+    while (keys.length < 4) {
+      keys.push(first);
+    }
+  }
+  return keys;
 }
 
 export function validateGeminiKeysOnStartup(): void {
-  const keys = getGeminiApiKeys();
-  if (keys.length === 0) {
-    const errorMsg = "FATAL ERROR: GEMINI_API_KEYS is unset or empty in the environment. ULTRON requires at least one Gemini API key to start.";
+  const keysStr = process.env.GEMINI_API_KEYS || "";
+  const keys = keysStr.split(",").map(k => k.trim()).filter(Boolean);
+  if (keys.length !== 4) {
+    const errorMsg = `FATAL ERROR: GEMINI_API_KEYS must contain exactly 4 comma-separated keys. Found ${keys.length} key(s).`;
     customLogger.error(errorMsg);
     console.error(errorMsg);
     process.exit(1);
@@ -83,11 +95,13 @@ function detectInjection(text: string): boolean {
   return patterns.some(p => p.test(text));
 }
 
-async function callGemini(messages: ChatMessage[]): Promise<string> {
+async function callGeminiPool(messages: ChatMessage[], poolType: 'general' | 'reserved'): Promise<string> {
   const keys = getGeminiApiKeys();
-  if (keys.length === 0) {
-    throw new Error("No Gemini API keys configured");
+  if (keys.length !== 4) {
+    throw new Error("Gemini keys count is not 4");
   }
+
+  let lastError: Error | undefined = undefined;
 
   const { redis, redisConnected } = await import('../main');
 
@@ -102,53 +116,68 @@ async function callGemini(messages: ChatMessage[]): Promise<string> {
       parts: [{ text: msg.content }]
     }));
 
+  const isGeneral = poolType === 'general';
+  const poolIndices = isGeneral ? [0, 1] : [2, 3];
+  const redisIndexKey = isGeneral ? 'ultron:gemini:general_index' : 'ultron:gemini:reserved_index';
+
   let attempts = 0;
-  let currentIndex = 0;
+  let currentIndex = poolIndices[0];
 
   if (redisConnected && redis.isOpen) {
     try {
-      const storedIndex = await redis.get('ultron:gemini_key_index');
+      const storedIndex = await redis.get(redisIndexKey);
       if (storedIndex !== null) {
         const parsed = parseInt(storedIndex, 10);
-        if (!isNaN(parsed) && parsed >= 0 && parsed < keys.length) {
+        if (!isNaN(parsed) && poolIndices.includes(parsed)) {
           currentIndex = parsed;
         }
       }
     } catch (e) {
-      customLogger.error("Failed to read sticky key index from Redis", e);
+      customLogger.error(`Failed to read sticky key index from Redis for ${poolType} pool`, e);
     }
   } else {
-    currentIndex = fallbackKeyIndex % keys.length;
+    const fallbackIdx = isGeneral ? fallbackGeneralIndex : fallbackReservedIndex;
+    currentIndex = poolIndices[fallbackIdx % poolIndices.length];
   }
 
-  while (attempts < keys.length) {
+  while (attempts < poolIndices.length) {
     let isCooling = false;
+    let isFailed = false;
+
     if (redisConnected && redis.isOpen) {
       try {
-        const cooldownVal = await redis.get(`ultron:gemini_key_cooldown:${currentIndex}`);
-        isCooling = cooldownVal !== null;
+        isCooling = (await redis.get(`ultron:gemini_key_cooldown:${currentIndex}`)) !== null;
+        isFailed = (await redis.get(`ultron:gemini_key_failure:${currentIndex}`)) !== null;
       } catch (e) {
-        customLogger.error(`Failed to check key cooldown for index ${currentIndex} in Redis`, e);
+        customLogger.error(`Failed to check key state for index ${currentIndex} in Redis`, e);
       }
     } else {
       const expiresAt = fallbackCooldowns[currentIndex];
       isCooling = expiresAt !== undefined && Date.now() < expiresAt;
+      const failExpiresAt = fallbackFailures[currentIndex];
+      isFailed = failExpiresAt !== undefined && Date.now() < failExpiresAt;
     }
 
-    if (isCooling) {
+    if (isCooling || isFailed) {
       const oldIndex = currentIndex;
-      currentIndex = (currentIndex + 1) % keys.length;
+      const localIdx = poolIndices.indexOf(currentIndex);
+      const nextLocalIdx = (localIdx + 1) % poolIndices.length;
+      currentIndex = poolIndices[nextLocalIdx];
       
       if (redisConnected && redis.isOpen) {
         try {
-          await redis.set('ultron:gemini_key_index', currentIndex.toString());
+          await redis.set(redisIndexKey, currentIndex.toString());
         } catch (e) {}
       }
-      fallbackKeyIndex = currentIndex;
+      if (isGeneral) {
+        fallbackGeneralIndex = nextLocalIdx;
+      } else {
+        fallbackReservedIndex = nextLocalIdx;
+      }
 
       customLogger.system(JSON.stringify({
         event: "KEY_ROTATION",
-        reason: "cooldown_active",
+        reason: isCooling ? "cooldown_active" : "failure_active",
         failed_index: oldIndex,
         next_index: currentIndex
       }));
@@ -188,14 +217,20 @@ async function callGemini(messages: ChatMessage[]): Promise<string> {
           fallbackCooldowns[currentIndex] = expiresAt;
 
           const oldIndex = currentIndex;
-          currentIndex = (currentIndex + 1) % keys.length;
+          const localIdx = poolIndices.indexOf(currentIndex);
+          const nextLocalIdx = (localIdx + 1) % poolIndices.length;
+          currentIndex = poolIndices[nextLocalIdx];
 
           if (redisConnected && redis.isOpen) {
             try {
-              await redis.set('ultron:gemini_key_index', currentIndex.toString());
+              await redis.set(redisIndexKey, currentIndex.toString());
             } catch (e) {}
           }
-          fallbackKeyIndex = currentIndex;
+          if (isGeneral) {
+            fallbackGeneralIndex = nextLocalIdx;
+          } else {
+            fallbackReservedIndex = nextLocalIdx;
+          }
 
           customLogger.warn(JSON.stringify({
             event: "KEY_ROTATION",
@@ -228,6 +263,7 @@ async function callGemini(messages: ChatMessage[]): Promise<string> {
       if (err instanceof SafetyBlockError) {
         throw err;
       }
+      lastError = err;
       
       const errMessage = err.message || String(err);
       if (errMessage.includes("429") || errMessage.toLowerCase().includes("quota")) {
@@ -242,14 +278,20 @@ async function callGemini(messages: ChatMessage[]): Promise<string> {
         fallbackCooldowns[currentIndex] = expiresAt;
 
         const oldIndex = currentIndex;
-        currentIndex = (currentIndex + 1) % keys.length;
+        const localIdx = poolIndices.indexOf(currentIndex);
+        const nextLocalIdx = (localIdx + 1) % poolIndices.length;
+        currentIndex = poolIndices[nextLocalIdx];
 
         if (redisConnected && redis.isOpen) {
           try {
-            await redis.set('ultron:gemini_key_index', currentIndex.toString());
+            await redis.set(redisIndexKey, currentIndex.toString());
           } catch (e) {}
         }
-        fallbackKeyIndex = currentIndex;
+        if (isGeneral) {
+          fallbackGeneralIndex = nextLocalIdx;
+        } else {
+          fallbackReservedIndex = nextLocalIdx;
+        }
 
         customLogger.warn(JSON.stringify({
           event: "KEY_ROTATION",
@@ -263,35 +305,49 @@ async function callGemini(messages: ChatMessage[]): Promise<string> {
         continue;
       }
 
-      if (keys.length > 1) {
-        const oldIndex = currentIndex;
-        currentIndex = (currentIndex + 1) % keys.length;
+      const cooldownDuration = 300; // 5 minutes
+      const expiresAt = Date.now() + cooldownDuration * 1000;
+      if (redisConnected && redis.isOpen) {
+        try {
+          await redis.setEx(`ultron:gemini_key_failure:${currentIndex}`, cooldownDuration, expiresAt.toString());
+        } catch (e) {}
+      }
+      fallbackFailures[currentIndex] = expiresAt;
 
-        if (redisConnected && redis.isOpen) {
-          try {
-            await redis.set('ultron:gemini_key_index', currentIndex.toString());
-          } catch (e) {}
-        }
-        fallbackKeyIndex = currentIndex;
+      const oldIndex = currentIndex;
+      const localIdx = poolIndices.indexOf(currentIndex);
+      const nextLocalIdx = (localIdx + 1) % poolIndices.length;
+      currentIndex = poolIndices[nextLocalIdx];
 
-        customLogger.warn(JSON.stringify({
-          event: "KEY_ROTATION",
-          reason: "api_error",
-          failed_index: oldIndex,
-          next_index: currentIndex,
-          error: errMessage
-        }));
-
-        attempts++;
-        continue;
+      if (redisConnected && redis.isOpen) {
+        try {
+          await redis.set(redisIndexKey, currentIndex.toString());
+        } catch (e) {}
+      }
+      if (isGeneral) {
+        fallbackGeneralIndex = nextLocalIdx;
+      } else {
+        fallbackReservedIndex = nextLocalIdx;
       }
 
-      customLogger.error(`Genuine error on Gemini key index ${currentIndex}: ${errMessage}`);
-      throw err;
+      customLogger.warn(JSON.stringify({
+        event: "KEY_ROTATION",
+        reason: "api_error",
+        failed_index: oldIndex,
+        next_index: currentIndex,
+        error: errMessage
+      }));
+
+      attempts++;
+      continue;
     }
   }
 
-  throw new Error("All Gemini keys are currently cooling down or failed.");
+  throw lastError || new Error(`All Gemini keys in the ${poolType} pool are currently cooling down or failed.`);
+}
+
+async function callGemini(messages: ChatMessage[]): Promise<string> {
+  return callGeminiPool(messages, 'general');
 }
 
 async function callOpenAI(messages: ChatMessage[]): Promise<string> {
@@ -461,7 +517,7 @@ async function callCohere(messages: ChatMessage[]): Promise<string> {
   return text;
 }
 
-export async function generateAiResponse(
+async function generateAiResponseInternal(
   prompt: string,
   historyOrOnTransition?: any,
   onTransitionOrPushName?: any,
@@ -473,7 +529,8 @@ export async function generateAiResponse(
     senderJid: string;
     replyToName?: string;
     replyToJid?: string;
-  }
+  },
+  poolType: 'general' | 'reserved' = 'general'
 ): Promise<{ text: string; providerUsed: string }> {
   let history: ChatMessage[] = [];
   let onTransitionFn: ((status: string) => Promise<void>) | undefined = undefined;
@@ -524,8 +581,14 @@ export async function generateAiResponse(
     }));
   }
 
-  const priorityStr = process.env.AI_PROVIDER_PRIORITY || "Gemini,OpenAI,Claude,OpenRouter,DeepSeek,Groq,Mistral,Cohere";
-  const priorityList = priorityStr.split(",").map(p => p.trim()).filter(Boolean);
+  const isReserved = poolType === 'reserved';
+  const priorityList = isReserved
+    ? ["Gemini", "OpenAI", "Claude"]
+    : (process.env.AI_PROVIDER_PRIORITY || "Gemini,OpenAI,Claude,OpenRouter,DeepSeek,Groq,Mistral,Cohere")
+        .split(",")
+        .map(p => p.trim())
+        .filter(Boolean);
+
   const failures: { provider: string; error: string }[] = [];
 
   for (let i = 0; i < priorityList.length; i++) {
@@ -539,7 +602,7 @@ export async function generateAiResponse(
     if (providerNormalized === 'gemini') {
       providerName = "Gemini";
       apiKeyVar = "GEMINI_API_KEYS";
-      callFn = () => callGemini(fullMessages);
+      callFn = () => callGeminiPool(fullMessages, poolType);
     } else if (providerNormalized === 'openai') {
       providerName = "OpenAI";
       apiKeyVar = "OPENAI_API_KEY";
@@ -577,13 +640,41 @@ export async function generateAiResponse(
     const nextProviderRaw = priorityList[i + 1];
     const nextProviderName = nextProviderRaw ? nextProviderRaw.trim() : "";
 
-    // 1. Send/update thinking placeholder
+    // 1. Check if provider is cooling down or unreachable
+    let isCooling = false;
+    let isFailed = false;
+
+    const { redis, redisConnected } = await import('../main');
+    if (redisConnected && redis.isOpen) {
+      try {
+        isCooling = (await redis.get(`ultron:provider_cooldown:${providerNormalized}`)) !== null;
+        isFailed = (await redis.get(`ultron:provider_failure:${providerNormalized}`)) !== null;
+      } catch (e) {}
+    } else {
+      const cooldownExp = fallbackProviderCooldowns[providerNormalized];
+      isCooling = cooldownExp !== undefined && Date.now() < cooldownExp;
+      const failExp = fallbackProviderFailures[providerNormalized];
+      isFailed = failExp !== undefined && Date.now() < failExp;
+    }
+
+    if (isCooling || isFailed) {
+      customLogger.warn(`AI failover: Skipping provider ${providerName} because it is ${isCooling ? 'cooling down' : 'unreachable'}.`);
+      failures.push({ provider: providerName, error: isCooling ? "cooldown active" : "unreachable" });
+      
+      if (onTransitionFn && nextProviderName) {
+        await onTransitionFn(`⏳ [${providerName}] Cooling down or offline. Trying ${nextProviderName}...`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+      continue;
+    }
+
+    // 2. Send/update thinking placeholder
     if (onTransitionFn) {
       await onTransitionFn(`⏳ [${providerName}] Thinking...`);
     }
 
-    // 2. Check API Key
-    const apiKey = process.env[apiKeyVar] || (providerNormalized === 'gemini' ? process.env.GEMINI_API_KEY : undefined);
+    // 3. Check API Key
+    const apiKey = process.env[apiKeyVar] || (providerNormalized === 'gemini' ? (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY) : undefined);
     if (!apiKey) {
       customLogger.error(`AI failover: ${providerName} key missing.`);
       failures.push({ provider: providerName, error: "API key missing" });
@@ -595,7 +686,7 @@ export async function generateAiResponse(
       continue;
     }
 
-    // 3. Make the API Call
+    // 4. Make the call
     try {
       const text = await callFn();
       return { text, providerUsed: providerName };
@@ -609,6 +700,26 @@ export async function generateAiResponse(
       customLogger.error(`AI failover: ${providerName} failed: ${errMsg}`);
       failures.push({ provider: providerName, error: errMsg });
 
+      const is429 = errMsg.includes("429") || errMsg.toLowerCase().includes("rate limit") || errMsg.toLowerCase().includes("quota");
+      const cooldownDuration = 300; // 5 minutes
+      const expiresAt = Date.now() + cooldownDuration * 1000;
+
+      if (is429) {
+        if (redisConnected && redis.isOpen) {
+          try {
+            await redis.setEx(`ultron:provider_cooldown:${providerNormalized}`, cooldownDuration, expiresAt.toString());
+          } catch (e) {}
+        }
+        fallbackProviderCooldowns[providerNormalized] = expiresAt;
+      } else {
+        if (redisConnected && redis.isOpen) {
+          try {
+            await redis.setEx(`ultron:provider_failure:${providerNormalized}`, cooldownDuration, expiresAt.toString());
+          } catch (e) {}
+        }
+        fallbackProviderFailures[providerNormalized] = expiresAt;
+      }
+
       if (onTransitionFn && nextProviderName) {
         await onTransitionFn(`⏳ [${providerName}] Rate-limited. Trying ${nextProviderName}...`);
         await new Promise(resolve => setTimeout(resolve, 1000));
@@ -616,15 +727,146 @@ export async function generateAiResponse(
     }
   }
 
-  const errorHeader = "❌ *AI Failover Engine: All Providers Failed*";
+  const errorHeader = `❌ *AI Failover Engine: All Providers Failed in ${poolType} pool*`;
   const details = failures.map(f => `- *${f.provider}*: ${f.error}`).join("\n");
   throw new Error(`${errorHeader}\n\n${details}`);
 }
 
+export async function generateAiResponse(
+  prompt: string,
+  historyOrOnTransition?: any,
+  onTransitionOrPushName?: any,
+  phoneNumber?: string,
+  isFirstContact?: boolean,
+  groupContext?: {
+    isGroup: boolean;
+    senderName: string;
+    senderJid: string;
+    replyToName?: string;
+    replyToJid?: string;
+  }
+): Promise<{ text: string; providerUsed: string }> {
+  return generateAiResponseInternal(
+    prompt,
+    historyOrOnTransition,
+    onTransitionOrPushName,
+    phoneNumber,
+    isFirstContact,
+    groupContext,
+    'general'
+  );
+}
+
+export async function generateReservedAiResponse(
+  prompt: string,
+  historyOrOnTransition?: any,
+  onTransitionOrPushName?: any,
+  phoneNumber?: string,
+  isFirstContact?: boolean,
+  groupContext?: {
+    isGroup: boolean;
+    senderName: string;
+    senderJid: string;
+    replyToName?: string;
+    replyToJid?: string;
+  }
+): Promise<{ text: string; providerUsed: string }> {
+  return generateAiResponseInternal(
+    prompt,
+    historyOrOnTransition,
+    onTransitionOrPushName,
+    phoneNumber,
+    isFirstContact,
+    groupContext,
+    'reserved'
+  );
+}
+
+export function isReservedTask(message: any, text: string): boolean {
+  const msgType = Object.keys(message?.message || {})[0];
+  const isAttachment = ['imageMessage', 'documentMessage', 'videoMessage', 'audioMessage'].includes(msgType);
+  if (isAttachment) {
+    return true;
+  }
+
+  const cleanText = text.trim().toLowerCase();
+  const reservedPatterns = [
+    /^!summary\b/i,
+    /^!vision\b/i,
+    /^!ocr\b/i,
+    /\bpdf\b/i,
+    /\bvision\b/i,
+    /\bocr\b/i,
+    /\bimage\s+(check|analyze|generate|description)\b/i,
+    /\bsummarize\s+pdf\b/i,
+    /\bextract\s+text\b/i
+  ];
+  return reservedPatterns.some(p => p.test(cleanText));
+}
+
+export async function getApiStatusRegistry(): Promise<Record<string, string>> {
+  const { redis, redisConnected } = await import('../main');
+  const registry: Record<string, string> = {};
+
+  const getStatus = async (cooldownKey: string, failureKey: string, fallbackCooldownMap?: Record<string, number>, fallbackFailureMap?: Record<string, number>, keyStr?: string): Promise<string> => {
+    let isCooling = false;
+    let isFailed = false;
+
+    if (redisConnected && redis.isOpen) {
+      try {
+        isCooling = (await redis.get(cooldownKey)) !== null;
+        isFailed = (await redis.get(failureKey)) !== null;
+      } catch (e) {}
+    } else {
+      if (fallbackCooldownMap && keyStr) {
+        const exp = fallbackCooldownMap[keyStr];
+        isCooling = exp !== undefined && Date.now() < exp;
+      }
+      if (fallbackFailureMap && keyStr) {
+        const exp = fallbackFailureMap[keyStr];
+        isFailed = exp !== undefined && Date.now() < exp;
+      }
+    }
+
+    if (isCooling) return "Limit Reached (Cooling Down)";
+    if (isFailed) return "Unreachable";
+    return "Alive";
+  };
+
+  registry["Gemini Key 1"] = await getStatus("ultron:gemini_key_cooldown:0", "ultron:gemini_key_failure:0", fallbackCooldowns, fallbackFailures, "0");
+  registry["Gemini Key 2"] = await getStatus("ultron:gemini_key_cooldown:1", "ultron:gemini_key_failure:1", fallbackCooldowns, fallbackFailures, "1");
+  registry["Gemini Reserved 1"] = await getStatus("ultron:gemini_key_cooldown:2", "ultron:gemini_key_failure:2", fallbackCooldowns, fallbackFailures, "2");
+  registry["Gemini Reserved 2"] = await getStatus("ultron:gemini_key_cooldown:3", "ultron:gemini_key_failure:3", fallbackCooldowns, fallbackFailures, "3");
+
+  const providers = ["OpenAI", "Claude", "OpenRouter", "DeepSeek", "Groq", "Mistral", "Cohere"];
+  for (const provider of providers) {
+    const provLower = provider.toLowerCase();
+    registry[provider] = await getStatus(
+      `ultron:provider_cooldown:${provLower}`,
+      `ultron:provider_failure:${provLower}`,
+      fallbackProviderCooldowns,
+      fallbackProviderFailures,
+      provLower
+    );
+  }
+
+  return registry;
+}
+
 export function resetGeminiPoolState(): void {
-  fallbackKeyIndex = 0;
+  fallbackGeneralIndex = 0;
+  fallbackReservedIndex = 0;
   for (const key of Object.keys(fallbackCooldowns)) {
     delete fallbackCooldowns[Number(key)];
+  }
+  for (const key of Object.keys(fallbackFailures)) {
+    delete fallbackFailures[Number(key)];
+  }
+  for (const key of Object.keys(fallbackProviderCooldowns)) {
+    delete fallbackProviderCooldowns[key];
+  }
+  for (const key of Object.keys(fallbackProviderFailures)) {
+    delete fallbackProviderFailures[key];
   }
 }
 
