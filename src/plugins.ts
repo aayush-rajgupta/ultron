@@ -130,7 +130,7 @@ export class PluginRuntime {
             const secs = totalSeconds % 60;
             const uptimeStr = `${hours}h ${minutes}m ${secs}s`;
 
-            const afkStr = afkState.isAfk ? `Active (Reason: ${afkState.reason})` : `Inactive`;
+            const afkStr = afkState.active ? `Active (Reason: ${afkState.reason})` : `Inactive`;
 
             const emojiMap: Record<string, string> = {
               "Alive": "🟢",
@@ -139,7 +139,7 @@ export class PluginRuntime {
             };
 
             const registryText = [
-              `🤖 *ULTRON v4.5 STATUS REGISTRY:*`,
+              `🤖 *ULTRON v5.0 STATUS REGISTRY:*`,
               `${emojiMap[registry["Gemini Key 1"]] || "🔴"} Gemini Key 1: ${registry["Gemini Key 1"]}`,
               `${emojiMap[registry["Gemini Key 2"]] || "🔴"} Gemini Key 2: ${registry["Gemini Key 2"]}`,
               `${emojiMap[registry["Gemini Reserved 1"]] || "🔴"} Gemini Reserved 1: ${registry["Gemini Reserved 1"]}`,

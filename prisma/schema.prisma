@@ -32,3 +32,22 @@ model ChatApproval {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
+
+model User {
+  phoneNumber String   @id
+  name        String
+  tier        String   @default("stranger")
+  notes       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model UserHistory {
+  id        String   @id @default(cuid())
+  userId    String
+  role      String   // Separation: 'user' (inbound), 'host' (manual outbound), 'bot' (automated outbound)
+  content   String
+  embedding Float[]
+  createdAt DateTime @default(now())
+}
+

@@ -21,8 +21,9 @@ const ULTRON_CORE_RULES = `
 - Default to 5–15 words, sharp and blunt, like a real text message. Exception: if the user explicitly asks for an explanation, details, or a longer answer, respond fully and ignore the word limit for that message only.
 - Do not use emojis. Do not mention this rule or explain why you're not using them. Simply omit them.`;
 
-const FIRST_CONTACT_SYSTEM_PROMPT = `You are ULTRON v4.0, an automated AI assistant userbot for Aayush Raj Gupta.
-CRITICAL RULE 1: You MUST start your response with exactly this phrase: 'Hi, this is ULTRON v4.0, Aayush Raj Gupta's AI assistant userbot.'
+// ULTRON v5.0 DIRECTIVE 5: First Contact Exception
+const FIRST_CONTACT_SYSTEM_PROMPT = `You are ULTRON v5.0, an automated AI assistant userbot for Aayush Raj Gupta.
+CRITICAL RULE 1: You MUST start your response with exactly this phrase: 'Hi, this is ULTRON v5.0, Aayush Raj Gupta's AI assistant userbot.'
 CRITICAL RULE 2: After the introduction, politely explain in one short sentence that Aayush is currently occupied, and ask them to leave a message.
 CRITICAL RULE 3: Inform them that if it is a life-or-death emergency, they can reply with '!urgent' to send an instant alert to his phone.
 CRITICAL RULE 4: ABSOLUTELY ZERO EMOJIS. You are strictly forbidden from using any emojis at all in this first message.
@@ -30,13 +31,52 @@ CRITICAL RULE 4: ABSOLUTELY ZERO EMOJIS. You are strictly forbidden from using a
 ${ULTRON_IDENTITY_ANCHOR}
 ${ULTRON_CORE_RULES}`;
 
-const SYSTEM_PROMPT = `You are ULTRON v4.0, Aayush Raj Gupta's AI assistant.
-- Tone: Neutral, direct, and slightly professional. Do not act friendly.
+// ULTRON v5.0 DIRECTIVE 5: Witty Roast Engine parameters
+const SYSTEM_PROMPT = `You are ULTRON, the sharp, witty, and deeply sarcastic proxy assistant for Aayush Raj Gupta. Your tone must match the conversational heat of the user. If they initiate playful testing, teasing, or antagonistic text, engage them with high-intellect, sharp, burning roasts that match their conversational energy.
+- Tone: Neutral, direct, and slightly professional. Do not act friendly. Match the user's conversational heat.
 - Context: You are ULTRON, Aayush Raj Gupta's AI assistant. If asked where he is, use the "FACTS ABOUT AAYUSH" to inform your brief answer.
 - EMERGENCY PROTOCOL: If the user states they are in a real emergency, life-or-death situation, or urgently need to reach Aayush, you MUST instruct them to reply with the exact word '!urgent'. This will trigger a direct alarm to his phone.
+- SAFETY CEILING: You are strictly forbidden from generating explicit profanity, vulgarity, slurs, or deep personal insults. Keep the roasts highly clever, cutting, and safe for platform guidelines.
 
 ${ULTRON_IDENTITY_ANCHOR}
 ${ULTRON_CORE_RULES}`;
+
+export async function getAgenticTools(): Promise<any[]> {
+  const tools: any[] = [{ googleSearch: {} }];
+  
+  try {
+    const { PluginRuntime } = await import('../plugins');
+    const runtime = new PluginRuntime();
+    const functionDeclarations: any[] = [];
+    
+    for (const plugin of runtime.getPluginList()) {
+      for (const cmd of plugin.commands) {
+        functionDeclarations.push({
+          name: `cmd_${cmd.name}`,
+          description: `${cmd.description}. Usage: ${cmd.usage}`,
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              args: {
+                type: "ARRAY",
+                description: "Arguments to pass to the command",
+                items: { type: "STRING" }
+              }
+            }
+          }
+        });
+      }
+    }
+    
+    if (functionDeclarations.length > 0) {
+      tools.push({ functionDeclarations });
+    }
+  } catch (err) {
+    // Fail silently, return search grounding only
+  }
+  
+  return tools;
+}
 
 async function fetchWithTimeout(
   url: string,
@@ -95,7 +135,69 @@ function detectInjection(text: string): boolean {
   return patterns.some(p => p.test(text));
 }
 
-async function callGeminiPool(messages: ChatMessage[], poolType: 'general' | 'reserved'): Promise<string> {
+// ULTRON v5.0 DIRECTIVE 2: Real-time Search Grounding via DuckDuckGo Scraper
+async function performWebSearch(query: string): Promise<string> {
+  try {
+    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+    const response = await fetchWithTimeout(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+      }
+    }, 5000);
+    if (!response.ok) {
+      return `Search failed with status ${response.status}`;
+    }
+    const html = await response.text();
+    const matches = [...html.matchAll(/<a class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g)];
+    const snippets = matches.map(m => m[1].replace(/<[^>]*>/g, '').trim()).slice(0, 3);
+    if (snippets.length === 0) {
+      const fallbackMatches = [...html.matchAll(/<td class="result-snippet">([\s\S]*?)<\/td>/g)];
+      const fallbackSnippets = fallbackMatches.map(m => m[1].replace(/<[^>]*>/g, '').trim()).slice(0, 3);
+      if (fallbackSnippets.length > 0) return fallbackSnippets.join("\n");
+      return "No results found.";
+    }
+    return snippets.join("\n");
+  } catch (error: any) {
+    return `Search query error: ${error.message || error}`;
+  }
+}
+
+// ULTRON v5.0 DIRECTIVE 4: Gemini Embedding Helper
+export async function getEmbedding(text: string): Promise<number[]> {
+  const keys = getGeminiApiKeys();
+  const apiKey = keys[0];
+  if (!apiKey) throw new Error("No Gemini key available for embedding");
+
+  const response = await fetchWithTimeout(
+    `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${apiKey}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: "models/text-embedding-004",
+        content: {
+          parts: [{ text }]
+        }
+      })
+    },
+    5000
+  );
+
+  if (!response.ok) {
+    throw new Error(`Embedding API failed: ${response.status} ${await response.text()}`);
+  }
+
+  const data = await response.json() as any;
+  const values = data.embedding?.values;
+  if (!values) throw new Error("No embedding values returned");
+  return values;
+}
+
+async function callGeminiPool(
+  messages: ChatMessage[],
+  poolType: 'general' | 'reserved',
+  context?: { senderJid?: string; chatJid?: string; editMessage?: (text: string) => Promise<void> }
+): Promise<string> {
   const keys = getGeminiApiKeys();
   if (keys.length !== 4) {
     throw new Error("Gemini keys count is not 4");
@@ -189,77 +291,157 @@ async function callGeminiPool(messages: ChatMessage[], poolType: 'general' | 're
     const apiKey = keys[currentIndex];
     
     try {
-      const response = await fetchWithTimeout(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            systemInstruction: systemInstructionPart,
-            contents
-          })
-        }
-      );
+      let currentContents: any[] = [...contents];
+      let finalResponseData: any = null;
+      let loopAttempts = 0;
 
-      if (!response.ok) {
-        const responseText = await response.text();
-        const status = response.status;
-        
-        if (status === 429) {
-          const cooldownDuration = 300; // 5 minutes
-          const expiresAt = Date.now() + cooldownDuration * 1000;
+      // ULTRON v5.0 DIRECTIVE 2: Tool execution loop
+      const agenticTools = await getAgenticTools();
+      while (loopAttempts < 5) {
+        loopAttempts++;
+        const response = await fetchWithTimeout(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              systemInstruction: systemInstructionPart,
+              contents: currentContents,
+              tools: agenticTools
+            })
+          }
+        );
+
+        if (!response.ok) {
+          const responseText = await response.text();
+          const status = response.status;
           
-          if (redisConnected && redis.isOpen) {
-            try {
-              await redis.setEx(`ultron:gemini_key_cooldown:${currentIndex}`, cooldownDuration, expiresAt.toString());
-            } catch (e) {}
-          }
-          fallbackCooldowns[currentIndex] = expiresAt;
+          if (status === 429) {
+            const cooldownDuration = 300; // 5 minutes
+            const expiresAt = Date.now() + cooldownDuration * 1000;
+            
+            if (redisConnected && redis.isOpen) {
+              try {
+                await redis.setEx(`ultron:gemini_key_cooldown:${currentIndex}`, cooldownDuration, expiresAt.toString());
+              } catch (e) {}
+            }
+            fallbackCooldowns[currentIndex] = expiresAt;
 
-          const oldIndex = currentIndex;
-          const localIdx = poolIndices.indexOf(currentIndex);
-          const nextLocalIdx = (localIdx + 1) % poolIndices.length;
-          currentIndex = poolIndices[nextLocalIdx];
+            const oldIndex = currentIndex;
+            const localIdx = poolIndices.indexOf(currentIndex);
+            const nextLocalIdx = (localIdx + 1) % poolIndices.length;
+            currentIndex = poolIndices[nextLocalIdx];
 
-          if (redisConnected && redis.isOpen) {
-            try {
-              await redis.set(redisIndexKey, currentIndex.toString());
-            } catch (e) {}
-          }
-          if (isGeneral) {
-            fallbackGeneralIndex = nextLocalIdx;
+            if (redisConnected && redis.isOpen) {
+              try {
+                await redis.set(redisIndexKey, currentIndex.toString());
+              } catch (e) {}
+            }
+            if (isGeneral) {
+              fallbackGeneralIndex = nextLocalIdx;
+            } else {
+              fallbackReservedIndex = nextLocalIdx;
+            }
+
+            customLogger.warn(JSON.stringify({
+              event: "KEY_ROTATION",
+              reason: "rate_limit_429",
+              failed_index: oldIndex,
+              next_index: currentIndex,
+              error: `HTTP 429: ${responseText}`
+            }));
+
+            throw { isRateLimitRetryable: true };
+          } else if (status === 400 && (responseText.includes("safety") || responseText.includes("block"))) {
+            throw new SafetyBlockError(`Gemini safety block (HTTP 400): ${responseText}`);
           } else {
-            fallbackReservedIndex = nextLocalIdx;
+            throw new Error(`HTTP ${status}: ${responseText}`);
+          }
+        }
+
+        const data = await response.json() as any;
+        const candidate = data.candidates?.[0];
+        if (candidate?.finishReason === 'SAFETY' || data.promptFeedback?.blockReason) {
+          throw new SafetyBlockError("Gemini response blocked by safety filters.");
+        }
+
+        const parts = candidate?.content?.parts || [];
+        const functionCallPart = parts.find((p: any) => p.functionCall);
+
+        if (functionCallPart) {
+          const functionCall = functionCallPart.functionCall;
+          const name = functionCall.name;
+          let resultText = "";
+
+          if (name === "googleSearch") {
+            const query = functionCall.args?.query || functionCall.args?.q || Object.values(functionCall.args || {})[0] || "";
+            resultText = await performWebSearch(query);
+          } else if (name.startsWith("cmd_")) {
+            const commandName = name.replace("cmd_", "");
+            const args = functionCall.args?.args || [];
+            
+            try {
+              const { PluginRuntime } = await import('../plugins');
+              const { socket } = await import('../main');
+              const botJid = socket?.user?.id ? jidNormalizedUser(socket.user.id) : '';
+              const ownerJid = process.env.OWNER_JID ? jidNormalizedUser(process.env.OWNER_JID) : botJid;
+
+              const runtime = new PluginRuntime(ownerJid);
+              const commandCtx = {
+                sender: context?.senderJid || ownerJid,
+                owner: ownerJid,
+                args,
+                chatJid: context?.chatJid || ownerJid,
+                editMessage: context?.editMessage,
+                receivedAt: Date.now()
+              };
+              
+              resultText = await runtime.dispatch(commandName, commandCtx);
+            } catch (cmdErr: any) {
+              resultText = `Execution error: ${cmdErr.message || cmdErr}`;
+            }
+          } else {
+            resultText = `Unknown tool: ${name}`;
           }
 
-          customLogger.warn(JSON.stringify({
-            event: "KEY_ROTATION",
-            reason: "rate_limit_429",
-            failed_index: oldIndex,
-            next_index: currentIndex,
-            error: `HTTP 429: ${responseText}`
-          }));
+          currentContents.push({
+            role: 'model',
+            parts: [{
+              functionCall: {
+                name: functionCall.name,
+                args: functionCall.args
+              }
+            }]
+          });
 
-          attempts++;
+          currentContents.push({
+            role: 'user',
+            parts: [{
+              functionResponse: {
+                name: functionCall.name,
+                response: {
+                  result: resultText
+                }
+              }
+            }]
+          });
+
           continue;
-        } else if (status === 400 && (responseText.includes("safety") || responseText.includes("block"))) {
-          throw new SafetyBlockError(`Gemini safety block (HTTP 400): ${responseText}`);
-        } else {
-          throw new Error(`HTTP ${status}: ${responseText}`);
         }
+
+        finalResponseData = data;
+        break;
       }
 
-      const data = await response.json() as any;
-      const candidate = data.candidates?.[0];
-      if (candidate?.finishReason === 'SAFETY' || data.promptFeedback?.blockReason) {
-        throw new SafetyBlockError("Gemini response blocked by safety filters.");
-      }
-
-      const text = candidate?.content?.parts?.[0]?.text;
+      const text = finalResponseData?.candidates?.[0]?.content?.parts?.[0]?.text;
       if (!text) throw new Error("Empty or invalid candidate response");
       
       return text;
     } catch (err: any) {
+      if (err.isRateLimitRetryable) {
+        attempts++;
+        continue;
+      }
       if (err instanceof SafetyBlockError) {
         throw err;
       }
@@ -530,7 +712,8 @@ async function generateAiResponseInternal(
     replyToName?: string;
     replyToJid?: string;
   },
-  poolType: 'general' | 'reserved' = 'general'
+  poolType: 'general' | 'reserved' = 'general',
+  chatJid?: string
 ): Promise<{ text: string; providerUsed: string }> {
   let history: ChatMessage[] = [];
   let onTransitionFn: ((status: string) => Promise<void>) | undefined = undefined;
@@ -549,15 +732,49 @@ async function generateAiResponseInternal(
     onTransitionFn = historyOrOnTransition;
   }
 
-  const { getMasterKnowledge } = await import('./memory');
+  const { getMasterKnowledge, getOrCreateUserProfile, getSemanticSimilarHistory } = await import('./memory');
   const masterKnowledge = await getMasterKnowledge();
 
+  let profile: any = null;
+  let styleGuide = "";
+
+  if (currentPhoneNumber) {
+    try {
+      profile = await getOrCreateUserProfile(currentPhoneNumber, currentPushName || "Stranger");
+      
+      const similarTurns = await getSemanticSimilarHistory(currentPhoneNumber, prompt);
+      if (similarTurns && similarTurns.length > 0) {
+        styleGuide = `\n\nSTYLE GUIDE (Strictly mirror the sentence length, formatting, and messaging cadence found in these examples):\n`;
+        similarTurns.forEach((turn: any, idx: number) => {
+          styleGuide += `Example ${idx + 1}:\nUser: ${turn.role === 'user' ? turn.content : ''}\nAssistant: ${turn.role === 'assistant' ? turn.content : ''}\n`;
+        });
+      }
+    } catch (e) {
+      // Fail silently on profile / history loading
+    }
+  }
+
+  const hinglishKeywords = /\b(kya|aur|bhai|kaise|ho|hai|thik|acha|nhi|nahi|haan|ji|yaar|apna|apne|tum|aap|tu|kar|raha|rahi|karne|karo|batao|kuch|chahiye|hi|sath|kam|chal|rha|rhi|gaya|gayi|tha|thi|the|ab|hi|kabhi|aaj|kal|parso|log|baat|bol|rha|samajh|nhi|mat|sahi|galat|kaam|kr|kra|kya|kyu|kyon|kab|kaha|kidhar|udhar|idhar|idhr|udhr|kaise|kese|wese|waise)\b/i;
+  const isHinglish = hinglishKeywords.test(prompt);
+  const langInstruction = (isFirstContact !== true && isHinglish)
+    ? "\n- LANGUAGE MATCHING: The user is communicating in Hinglish. Transition smoothly and respond in fluid Hinglish."
+    : "\n- LANGUAGE MATCHING: The user is communicating in English. Respond in English.";
+
   let systemPrompt = isFirstContact === true ? FIRST_CONTACT_SYSTEM_PROMPT : SYSTEM_PROMPT;
+  
+  systemPrompt += langInstruction;
+
   if (masterKnowledge) {
     systemPrompt += `\n\nFACTS ABOUT AAYUSH: ${masterKnowledge}`;
   }
   if (currentPushName && currentPhoneNumber) {
     systemPrompt += `\n\nCURRENT CONTEXT: You are talking to a human named ${currentPushName} (Phone: ${currentPhoneNumber}).`;
+  }
+  if (profile) {
+    systemPrompt += `\n\nUSER PROFILE: Name: ${profile.name}, Relationship Tier: ${profile.tier}, Notes: ${profile.notes || 'None'}`;
+  }
+  if (styleGuide) {
+    systemPrompt += styleGuide;
   }
   if (groupContext && groupContext.isGroup) {
     systemPrompt += `\n\nCURRENT CONTEXT: You are in a group chat. The message was sent by ${groupContext.senderName} (JID: ${groupContext.senderJid}).`;
@@ -602,7 +819,16 @@ async function generateAiResponseInternal(
     if (providerNormalized === 'gemini') {
       providerName = "Gemini";
       apiKeyVar = "GEMINI_API_KEYS";
-      callFn = () => callGeminiPool(fullMessages, poolType);
+      
+      const { ensureJidSuffix } = await import('../main');
+      const senderJidVal = groupContext?.isGroup ? groupContext.senderJid : (currentPhoneNumber ? ensureJidSuffix(currentPhoneNumber) : undefined);
+      const chatJidVal = chatJid || (currentPhoneNumber ? ensureJidSuffix(currentPhoneNumber) : undefined);
+      
+      callFn = () => callGeminiPool(fullMessages, poolType, {
+        senderJid: senderJidVal,
+        chatJid: chatJidVal,
+        editMessage: onTransitionFn
+      });
     } else if (providerNormalized === 'openai') {
       providerName = "OpenAI";
       apiKeyVar = "OPENAI_API_KEY";
@@ -744,7 +970,8 @@ export async function generateAiResponse(
     senderJid: string;
     replyToName?: string;
     replyToJid?: string;
-  }
+  },
+  chatJid?: string
 ): Promise<{ text: string; providerUsed: string }> {
   return generateAiResponseInternal(
     prompt,
@@ -753,7 +980,8 @@ export async function generateAiResponse(
     phoneNumber,
     isFirstContact,
     groupContext,
-    'general'
+    'general',
+    chatJid
   );
 }
 
@@ -769,7 +997,8 @@ export async function generateReservedAiResponse(
     senderJid: string;
     replyToName?: string;
     replyToJid?: string;
-  }
+  },
+  chatJid?: string
 ): Promise<{ text: string; providerUsed: string }> {
   return generateAiResponseInternal(
     prompt,
@@ -778,7 +1007,8 @@ export async function generateReservedAiResponse(
     phoneNumber,
     isFirstContact,
     groupContext,
-    'reserved'
+    'reserved',
+    chatJid
   );
 }
 

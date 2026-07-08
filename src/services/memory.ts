@@ -295,3 +295,139 @@ export async function setAfkNotifiedAtSession(jid: string, sessionStart: number)
   fallbackChatState.set(jid, fallback);
 }
 
+// ULTRON v5.0 DIRECTIVE 3: Cross-Channel User Profile Tracking
+export interface UserProfile {
+  phoneNumber: string;
+  name: string;
+  tier: string;
+  notes: string | null;
+}
+
+export async function getOrCreateUserProfile(phoneNumber: string, defaultName: string): Promise<UserProfile> {
+  const main = await import('../main');
+  const { prisma, prismaConnected } = main;
+
+  if (prismaConnected) {
+    try {
+      let user = await prisma.user.findUnique({ where: { phoneNumber } });
+      if (!user) {
+        user = await prisma.user.create({
+          data: {
+            phoneNumber,
+            name: defaultName,
+            tier: 'stranger',
+            notes: ''
+          }
+        });
+      }
+      return user;
+    } catch (err) {
+      // Ignore database errors and fallback
+    }
+  }
+
+  return {
+    phoneNumber,
+    name: defaultName,
+    tier: 'stranger',
+    notes: ''
+  };
+}
+
+// ULTRON v5.0 DIRECTIVE 4: Memory Vector Stage (Style Imitation RAG)
+export async function addUserHistory(
+  phoneNumber: string,
+  role: 'user' | 'host' | 'bot' | string,
+  content: string,
+  createdAt?: Date,
+  skipEmbedding?: boolean
+): Promise<void> {
+  const main = await import('../main');
+  const { prisma, prismaConnected } = main;
+  if (!prismaConnected) return;
+
+  try {
+    let embedding: number[] = [];
+    if (!skipEmbedding) {
+      try {
+        const aiService = await import('./ai');
+        embedding = await aiService.getEmbedding(content);
+      } catch (e) {
+        // Fail silently on embedding generation
+      }
+    }
+
+    await prisma.userHistory.create({
+      data: {
+        userId: phoneNumber,
+        role,
+        content,
+        embedding: embedding.length > 0 ? embedding : [],
+        createdAt: createdAt || new Date()
+      }
+    });
+  } catch (err) {
+    // Fail silently
+  }
+}
+
+function cosineSimilarity(vecA: number[], vecB: number[]): number {
+  let dotProduct = 0.0;
+  let normA = 0.0;
+  let normB = 0.0;
+  const len = Math.min(vecA.length, vecB.length);
+  for (let i = 0; i < len; i++) {
+    dotProduct += vecA[i] * vecB[i];
+    normA += vecA[i] * vecA[i];
+    normB += vecB[i] * vecB[i];
+  }
+  if (normA === 0 || normB === 0) return 0;
+  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+export async function getSemanticSimilarHistory(phoneNumber: string, queryText: string): Promise<{ role: string; content: string }[]> {
+  const main = await import('../main');
+  const { prisma, prismaConnected } = main;
+  if (!prismaConnected) return [];
+
+  try {
+    const aiService = await import('./ai');
+    const queryEmbedding = await aiService.getEmbedding(queryText);
+    const current_session_user_id = phoneNumber;
+
+    // 1. Try pgvector similarity query
+    try {
+      const embeddingStr = `[${queryEmbedding.join(',')}]`;
+      const similarRecords = await prisma.$queryRawUnsafe<any[]>(
+        `SELECT role, content FROM "UserHistory" 
+         WHERE "userId" = $1 AND array_length(embedding, 1) IS NOT NULL
+         ORDER BY embedding <=> $2::vector
+         LIMIT 3`,
+        current_session_user_id,
+        embeddingStr
+      );
+      if (similarRecords && similarRecords.length > 0) {
+        return similarRecords.map(r => ({ role: r.role, content: r.content }));
+      }
+    } catch (dbErr) {
+      // 2. Cosine similarity fallback in JS/TS
+      const records = await prisma.userHistory.findMany({
+        where: {
+          userId: current_session_user_id
+        }
+      });
+      const validRecords = records.filter(r => r.embedding && r.embedding.length > 0);
+      const recordsWithSim = validRecords.map(r => {
+        const sim = cosineSimilarity(queryEmbedding, r.embedding);
+        return { role: r.role, content: r.content, sim };
+      });
+      recordsWithSim.sort((a, b) => b.sim - a.sim);
+      return recordsWithSim.slice(0, 3).map(r => ({ role: r.role, content: r.content }));
+    }
+  } catch (err) {
+    // Fail silently
+  }
+  return [];
+}
+
+

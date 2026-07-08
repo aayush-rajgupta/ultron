@@ -161,7 +161,7 @@ test('AFK - auto-reply and deactivation', async () => {
   assert.equal(sentMessages.length, 1);
   assert.match(sentMessages[0].text, /My master is currently AFK/);
   assert.match(sentMessages[0].text, /Reason: Coding session/);
-  assert.match(sentMessages[0].text, /been away for 2 hours 15 minutes/);
+  assert.match(sentMessages[0].text, /Time away: 2h 15m 0s/);
 
   // Message from owner (should auto-deactivate AFK)
   const msgFromOwner = {

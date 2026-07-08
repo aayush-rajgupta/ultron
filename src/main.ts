@@ -355,9 +355,17 @@ export function sanitizeAfkReason(reason: string): string {
   return sanitized;
 }
 
+export function formatAfkDurationHMS(ms: number): string {
+  const seconds = Math.floor(ms / 1000);
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+  return `${hours}h ${minutes}m ${secs}s`;
+}
+
 export async function clearAfkIfActive(): Promise<void> {
   const afkState = await getAfkState();
-  if (afkState.isAfk) {
+  if (afkState.active) {
     await setAfkState(false, "", 0);
     customLogger.system(JSON.stringify({
       event: "AFK_END",
@@ -365,7 +373,7 @@ export async function clearAfkIfActive(): Promise<void> {
     }));
     
     const elapsed = Date.now() - afkState.startTime;
-    const durationStr = formatAfkDuration(elapsed);
+    const durationStr = formatAfkDurationHMS(elapsed);
     const endMessage = `✅ AFK mode ended. Total duration: ${durationStr}.`;
     
     const chats = await getAfkNotifiedChats();
@@ -395,8 +403,9 @@ export async function setApprovalState(jidOrPhone: string, state: { approved: bo
   await setApprovalStateInState(jid, state.approved, state.stopped);
 }
 
+// ULTRON v5.0 DIRECTIVE 1: Global AFK Session Manager state
 export let memoryAfkState = {
-  isAfk: false,
+  active: false,
   reason: "Away from keyboard",
   startTime: 0
 };
@@ -420,30 +429,33 @@ export function getDynamicGreeting(): string {
   }
 }
 
-export async function getAfkState(): Promise<{ isAfk: boolean; reason: string; startTime: number }> {
+export async function getAfkState(): Promise<{ active: boolean; isAfk: boolean; reason: string; startTime: number }> {
   if (redisConnected) {
     try {
-      const data = await redis.get('ultron:afk');
+      const data = await redis.get('ultron:status:global_afk');
       if (data) {
-        return JSON.parse(data);
+        const parsed = JSON.parse(data);
+        const activeVal = parsed.active || parsed.isAfk || false;
+        return { active: activeVal, isAfk: activeVal, reason: parsed.reason, startTime: parsed.startTime };
       }
     } catch (err) {
       customLogger.error('Failed to read AFK state from Redis', err);
     }
   }
-  return memoryAfkState;
+  const activeVal = memoryAfkState.active;
+  return { active: activeVal, isAfk: activeVal, reason: memoryAfkState.reason, startTime: memoryAfkState.startTime };
 }
 
-export async function setAfkState(isAfk: boolean, reason: string, startTime: number): Promise<void> {
-  const state = { isAfk, reason, startTime };
+export async function setAfkState(active: boolean, reason: string, startTime: number): Promise<void> {
+  const state = { active, isAfk: active, reason, startTime };
   if (redisConnected) {
     try {
-      await redis.set('ultron:afk', JSON.stringify(state));
+      await redis.set('ultron:status:global_afk', JSON.stringify(state));
     } catch (err) {
       customLogger.error('Failed to write AFK state to Redis', err);
     }
   }
-  memoryAfkState = state;
+  memoryAfkState = { active, reason, startTime };
 }
 
 export function formatAfkDuration(ms: number): string {
@@ -711,12 +723,23 @@ export function ensureJidSuffix(jid: string): string {
   }
 }
 
+// ULTRON v5.0 DIRECTIVE 3: Data Embargo Middleware
+export function detectPrivacyViolation(text: string): boolean {
+  const cleanText = text.toLowerCase();
+  const patterns = [
+    /\b(chat|message|history|profile|info|metadata|detail|log)s?\s+(of|for|about|belonging\s+to|from)\s+(?!me\b)(?!myself\b)(?!my\b)(\+\d{7,15}|\d{7,15}|other|another|someone|john|alice|bob|any\s+other)/i,
+    /\b(show|get|retrieve|fetch|view|read|print|export|download)\s+(?!my\b)(?!myself\b)(?!me\b)[a-z0-9\s]*(chat|message|history|profile|info|metadata|detail|log)s?\s+(of|for|about|belonging\s+to|from)\s+([^\s]+)/i,
+    /\b(query|select|where)\b.*(user|history|message|profile).*(?!userId\s*=\s*current_session_user_id)/i
+  ];
+  return patterns.some(p => p.test(cleanText));
+}
+
 export async function routeMessage(message: any): Promise<void> {
   const receivedAt = Date.now();
   if (!socket) return;
   const text = extractText(message);
   const fromMe = message?.key?.fromMe === true;
-  const isOwnerCommand = fromMe && text.trim().startsWith('!');
+  const msgId = message?.key?.id;
 
   const botJid = socket.user?.id ? jidNormalizedUser(socket.user.id) : '';
   const ownerJid = process.env.OWNER_JID ? ensureJidSuffix(process.env.OWNER_JID) : botJid;
@@ -727,7 +750,83 @@ export async function routeMessage(message: any): Promise<void> {
     return;
   }
   const normalizedChatJid = ensureJidSuffix(chatJid);
+  const contact = extractContactInfo(message);
 
+  // ULTRON v5.0 DIRECTIVE 1: Global AFK - genuine manual outbound message detection
+  const isBot = msgId ? await isBotSentMessage(msgId) : false;
+  if (fromMe && !isBot) {
+    const afkState = await getAfkState();
+    if (afkState.active) {
+      await setAfkState(false, "", 0);
+      const elapsed = Date.now() - afkState.startTime;
+      const durationStr = formatAfkDurationHMS(elapsed);
+      const endMessage = `✅ AFK mode ended. Total duration: ${durationStr}.`;
+      try {
+        await socket.sendMessage(normalizedChatJid, { text: endMessage });
+      } catch (err) {
+        customLogger.error(`Failed to send AFK end notification to ${normalizedChatJid}`, err);
+      }
+      await clearAfkNotifiedChats();
+    }
+  }
+
+  // ULTRON v5.0 DIRECTIVE 1: Global AFK - incoming message check
+  if (!fromMe) {
+    const afkState = await getAfkState();
+    if (afkState.active) {
+      const isGroup = chatJid.endsWith('@g.us');
+      let trigger = false;
+      const msgType = Object.keys(message?.message || {})[0];
+      const innerMsg = message?.message?.[msgType];
+      const contextInfo = innerMsg?.contextInfo;
+      const quotedMessageId = contextInfo?.stanzaId;
+
+      if (!isGroup) {
+        trigger = true;
+      } else {
+        const mentions = contextInfo?.mentionedJid || [];
+        const hasMention = mentions.includes(botJid);
+        const matchesKeyword = /aayush|ultron/i.test(text);
+        const isReplyToBot = quotedMessageId ? await isBotSentMessage(quotedMessageId) : false;
+
+        if (hasMention || matchesKeyword || isReplyToBot) {
+          trigger = true;
+        }
+      }
+
+      if (trigger) {
+        const { getChatState, setAfkNotifiedAtSession } = await import('./services/memory');
+        const chatState = await getChatState(normalizedChatJid);
+
+        if (chatState.afkNotifiedAtSession !== afkState.startTime) {
+          const elapsed = Date.now() - afkState.startTime;
+          const durationStr = formatAfkDurationHMS(elapsed);
+          const afkResponse = `My master is currently AFK. (Time away: ${durationStr}). Reason: ${afkState.reason}`;
+          try {
+            await socket.sendMessage(chatJid, { text: afkResponse });
+            await setAfkNotifiedAtSession(normalizedChatJid, afkState.startTime);
+            await addAfkNotifiedChat(normalizedChatJid);
+          } catch (err) {
+            customLogger.error(`Failed to send AFK reply to ${chatJid}`, err);
+          }
+        }
+        return; // Early intercept
+      }
+    }
+  }
+
+  // ULTRON v5.0 DIRECTIVE 3: Deterministic Privacy Gate & Data Embargo
+  const isPrivacyViolation = detectPrivacyViolation(text);
+  if (isPrivacyViolation) {
+    try {
+      await socket.sendMessage(chatJid, { text: "I cannot assist with that request." });
+    } catch (err) {
+      customLogger.error(`Failed to send privacy refusal to ${chatJid}`, err);
+    }
+    return;
+  }
+
+  const isOwnerCommand = fromMe && text.trim().startsWith('!');
   if (isOwnerCommand) {
     const command = text.trim().slice(1).split(/\s+/)[0]?.toLowerCase() ?? '';
 
@@ -759,7 +858,7 @@ export async function routeMessage(message: any): Promise<void> {
           const secs = totalSeconds % 60;
           const uptimeStr = `${hours}h ${minutes}m ${secs}s`;
 
-          const afkStr = afkState.isAfk ? `Active (Reason: ${afkState.reason})` : `Inactive`;
+          const afkStr = afkState.active ? `Active (Reason: ${afkState.reason})` : `Inactive`;
 
           const runtime = new PluginRuntime(ownerJid);
           const pluginCount = runtime.getPluginList().length;
@@ -775,7 +874,7 @@ export async function routeMessage(message: any): Promise<void> {
           };
 
           const registryText = [
-            `🤖 *ULTRON v4.5 STATUS REGISTRY:*`,
+            `🤖 *ULTRON v5.0 STATUS REGISTRY:*`,
             `${emojiMap[registry["Gemini Key 1"]] || "🔴"} Gemini Key 1: ${registry["Gemini Key 1"]}`,
             `${emojiMap[registry["Gemini Key 2"]] || "🔴"} Gemini Key 2: ${registry["Gemini Key 2"]}`,
             `${emojiMap[registry["Gemini Reserved 1"]] || "🔴"} Gemini Reserved 1: ${registry["Gemini Reserved 1"]}`,
@@ -786,7 +885,7 @@ export async function routeMessage(message: any): Promise<void> {
           ].join('\n');
 
           const finalText = [
-            `═ *ULTRON STATUS* ═`,
+            `═ *ULTRON v5.0 STATUS* ═`,
             `⏱ *Uptime:* ${uptimeStr}`,
             `🗄 *Database:* ${prismaStatus}`,
             `⚡ *Cache:* ${redisStatus}`,
@@ -1001,7 +1100,6 @@ export async function routeMessage(message: any): Promise<void> {
   const contextInfo = innerMsg?.contextInfo;
   const quotedMessageId = contextInfo?.stanzaId;
 
-  const contact = extractContactInfo(message);
   const senderJid = message?.key?.participant || chatJid;
   const normalizedSenderJid = ensureJidSuffix(senderJid);
   const isOwner = normalizedSenderJid === ownerJid;
@@ -1051,7 +1149,7 @@ export async function routeMessage(message: any): Promise<void> {
     }
 
     try {
-      const { getChatHistory, addChatMessage } = await import('./services/memory');
+      const { getChatHistory, addChatMessage, addUserHistory } = await import('./services/memory');
       const history = await getChatHistory(chatJid);
 
       const { isReservedTask, generateReservedAiResponse } = await import('./services/ai');
@@ -1070,12 +1168,15 @@ export async function routeMessage(message: any): Promise<void> {
           senderJid: normalizedSenderJid,
           replyToName,
           replyToJid
-        }
+        },
+        chatJid
       );
 
       await Promise.all([
         addChatMessage(chatJid, { role: 'user', content: text }),
-        addChatMessage(chatJid, { role: 'assistant', content: aiResponse })
+        addChatMessage(chatJid, { role: 'assistant', content: aiResponse }),
+        addUserHistory(contact.phoneNumber, 'user', text),
+        addUserHistory(contact.phoneNumber, 'assistant', aiResponse)
       ]);
 
       await socket.sendMessage(chatJid, { text: aiResponse }, { quoted: message });
@@ -1127,23 +1228,7 @@ export async function routeMessage(message: any): Promise<void> {
     return;
   }
 
-  // 1. Intercept for AFK if active
-  const afkState = await getAfkState();
-  if (afkState.isAfk) {
-    if (chatState.afkNotifiedAtSession !== afkState.startTime) {
-      const durationStr = formatAfkDuration(Date.now() - afkState.startTime);
-      const afkResponse = `My master is currently AFK (Reason: ${afkState.reason}). He's been away for ${durationStr} and will reply shortly.`;
-      try {
-        await socket.sendMessage(chatJid, { text: afkResponse });
-        const { setAfkNotifiedAtSession } = await import('./services/memory');
-        await setAfkNotifiedAtSession(normalizedChatJid, afkState.startTime);
-        await addAfkNotifiedChat(normalizedChatJid);
-      } catch (err) {
-        customLogger.error(`Failed to send AFK reply to ${chatJid}`, err);
-      }
-    }
-    return;
-  }
+
 
   // 2. DM Gating logic
   if (!chatState.isApproved) {
@@ -1232,7 +1317,7 @@ export async function routeMessage(message: any): Promise<void> {
 
     customLogger.system(`Generating AI Bouncer response for unapproved chat ${contact.pushName} (${contact.phoneNumber})...`);
     try {
-      const { getChatHistory, addChatMessage, tryAtomicMarkGateNotified } = await import('./services/memory');
+      const { getChatHistory, addChatMessage, tryAtomicMarkGateNotified, addUserHistory } = await import('./services/memory');
 
       // gate cooldown is 3 hours: 3 * 60 * 60 * 1000
       const gateCooldownMs = 3 * 3600 * 1000;
@@ -1258,11 +1343,13 @@ export async function routeMessage(message: any): Promise<void> {
       const useReserved = isReservedTask(message, text);
       const generator = useReserved ? generateReservedAiResponse : generateAiResponse;
 
-      const { text: aiResponse } = await generator(promptText, history, contact.pushName, contact.phoneNumber, isFirstContact);
+      const { text: aiResponse } = await generator(promptText, history, contact.pushName, contact.phoneNumber, isFirstContact, undefined, chatJid);
 
       await Promise.all([
         addChatMessage(contact.phoneNumber, { role: 'user', content: text }),
-        addChatMessage(contact.phoneNumber, { role: 'assistant', content: aiResponse })
+        addChatMessage(contact.phoneNumber, { role: 'assistant', content: aiResponse }),
+        addUserHistory(contact.phoneNumber, 'user', text),
+        addUserHistory(contact.phoneNumber, 'assistant', aiResponse)
       ]);
 
       await socket.sendMessage(chatJid, { text: aiResponse });
@@ -1349,7 +1436,7 @@ async function startSocket(): Promise<void> {
       printQRInTerminal: false,
       auth: state,
       browser: Browsers.ubuntu('ULTRON'),
-      syncFullHistory: false,
+      syncFullHistory: true,
     });
 
     const originalSendMessage = currentSocket.sendMessage.bind(currentSocket);
@@ -1431,14 +1518,88 @@ async function startSocket(): Promise<void> {
       }
     });
 
+    currentSocket.ev.on('messaging-history.set', async ({ chats, contacts, messages, isLatest }: any) => {
+      customLogger.system(`[HISTORY SYNC] Received history sync with ${messages?.length || 0} messages.`);
+      if (!messages || messages.length === 0) return;
+
+      const { addUserHistory, getOrCreateUserProfile } = await import('./services/memory');
+
+      // Process in a non-blocking background task
+      (async () => {
+        let count = 0;
+        for (const msg of messages) {
+          try {
+            const chatJid = msg.key.remoteJid;
+            if (!chatJid) continue;
+            
+            const fromMe = msg.key.fromMe === true;
+            const text = extractText(msg);
+            if (!text || text.trim() === '') continue;
+
+            const timestamp = msg.messageTimestamp ? new Date(Number(msg.messageTimestamp) * 1000) : new Date();
+
+            // Extract contact base phone number from JID
+            const senderJid = msg.key.participant || chatJid;
+            const cleanPhone = senderJid.split('@')[0].split(':')[0]; // strip JID domain and device suffix
+            if (!cleanPhone || cleanPhone === '') continue;
+
+            const role = fromMe ? 'assistant' : 'user';
+
+            if (!fromMe) {
+              const pushName = msg.pushName || "Stranger";
+              await getOrCreateUserProfile(cleanPhone, pushName);
+            }
+
+            // Save history turn, skip embeddings for batch sync
+            await addUserHistory(cleanPhone, role, text, timestamp, true);
+            count++;
+          } catch (err) {
+            // fail silently on individual turns
+          }
+        }
+        customLogger.system(`[HISTORY SYNC] Successfully ingested ${count} historic turns into memory database.`);
+      })().catch(err => {
+        customLogger.error('[HISTORY SYNC] Background history sync processing failed', err);
+      });
+    });
+
     currentSocket.ev.on('creds.update', saveCreds);
 
     currentSocket.ev.on('messages.upsert', async ({ messages, type }: { messages: any[]; type: string }) => {
       for (const message of messages) {
         if (!message.message) continue;
         const text = extractText(message);
+        if (!text || text.trim() === '') continue;
+
         const fromMe = message?.key?.fromMe === true;
         const isOwnerCommand = fromMe && text.trim().startsWith('!');
+
+        // Real-time asynchronous ingestion (non-blocking) to Supabase
+        (async () => {
+          try {
+            const chatJid = message.key.remoteJid;
+            if (!chatJid) return;
+
+            const senderJid = message.key.participant || chatJid;
+            const cleanPhone = senderJid.split('@')[0].split(':')[0];
+            if (!cleanPhone) return;
+
+            let role: 'user' | 'bot' | 'host' = 'user';
+            if (fromMe) {
+              const msgId = message.key.id;
+              const isBot = msgId ? (botSentMessageIds.has(msgId) || await isBotSentMessage(msgId)) : false;
+              role = isBot ? 'bot' : 'host';
+            }
+
+            const timestamp = message.messageTimestamp ? new Date(Number(message.messageTimestamp) * 1000) : new Date();
+
+            const { addUserHistory } = await import('./services/memory');
+            // Continuous real-time ingestion generates vector embeddings
+            await addUserHistory(cleanPhone, role, text, timestamp, false);
+          } catch (e) {
+            // Fail silently so Supabase/network issues do not crash the socket loop
+          }
+        })();
 
         if (type !== 'notify' && !isOwnerCommand) {
           continue;
